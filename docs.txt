@@ -1,0 +1,597 @@
+// tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "removeComments": false,
+    "noImplicitAny": false,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "moduleResolution": "node",
+    "baseUrl": "./",
+    "paths": {
+      "@/*": ["src/*"]
+    }
+  },
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "**/*.test.ts"
+  ]
+}
+
+// package.json (updated dependencies)
+{
+  "name": "whatsapp-tracker-typeorm",
+  "version": "1.0.0",
+  "description": "WhatsApp message tracker with TypeORM",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "dev:watch": "ts-node --watch src/index.ts",
+    "typeorm": "typeorm-ts-node-commonjs",
+    "migration:generate": "npm run typeorm -- migration:generate src/migrations/Migration",
+    "migration:run": "npm run typeorm -- migration:run -d src/database/data-source.ts",
+    "migration:revert": "npm run typeorm -- migration:revert -d src/database/data-source.ts",
+    "schema:sync": "npm run typeorm -- schema:sync -d src/database/data-source.ts",
+    "schema:drop": "npm run typeorm -- schema:drop -d src/database/data-source.ts"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "multer": "^1.4.5-lts.1",
+    "mime-types": "^2.1.35",
+    "typeorm": "^0.3.17",
+    "mssql": "^9.1.1",
+    "reflect-metadata": "^0.1.13",
+    "whatsapp-web.js": "^1.21.0",
+    "qrcode": "^1.5.3",
+    "socket.io": "^4.7.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.17",
+    "@types/cors": "^2.8.13",
+    "@types/multer": "^1.4.7",
+    "@types/mime-types": "^2.1.1",
+    "@types/node": "^20.0.0",
+    "@types/qrcode": "^1.5.0",
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.0"
+  }
+}
+
+// .env file (environment variables)
+# Database Configuration
+DB_TYPE=mssql
+DB_HOST=localhost
+DB_PORT=1433
+DB_USERNAME=General@Cyrus
+DB_PASSWORD=CyrusGeneral@Password
+DB_DATABASE=whatsap_tracker
+DB_ENCRYPT=false
+DB_TRUST_SERVER_CERTIFICATE=true
+
+# Application Configuration
+NODE_ENV=development
+PORT=3001
+WHATSAPP_PORT=3002
+
+# Media Storage
+MEDIA_DIR=./media
+UPLOAD_DIR=./uploads
+
+# Logging
+LOG_LEVEL=info
+
+// src/config/database.config.ts
+import { DataSourceOptions } from 'typeorm';
+import { Message } from '../entities/Message';
+import { Session } from '../entities/Session';
+import { Chat } from '../entities/Chat';
+import { MessageAnalytics } from '../entities/MessageAnalytics';
+
+export const databaseConfig: DataSourceOptions = {
+  type: 'mssql',
+  host: process.env.DB_HOST || 'localhost',
+  port: parseInt(process.env.DB_PORT || '1433'),
+  username: process.env.DB_USERNAME || 'General@Cyrus',
+  password: process.env.DB_PASSWORD || 'CyrusGeneral@Password',
+  database: process.env.DB_DATABASE || 'whatsap_tracker',
+  synchronize: process.env.NODE_ENV !== 'production', // Only sync in development
+  logging: process.env.NODE_ENV === 'development' ? ['query', 'error'] : ['error'],
+  entities: [Message, Session, Chat, MessageAnalytics],
+  migrations: ['src/migrations/*.ts'],
+  subscribers: ['src/subscribers/*.ts'],
+  options: {
+    encrypt: process.env.DB_ENCRYPT === 'true',
+    trustServerCertificate: process.env.DB_TRUST_SERVER_CERTIFICATE === 'true'
+  },
+  pool: {
+    max: 10,
+    min: 0,
+    acquireTimeoutMillis: 60000,
+    idleTimeoutMillis: 600000
+  }
+};
+
+// src/migrations/1700000000000-InitialMigration.ts
+import { MigrationInterface, QueryRunner } from 'typeorm';
+
+export class InitialMigration1700000000000 implements MigrationInterface {
+    name = 'InitialMigration1700000000000'
+
+    public async up(queryRunner: QueryRunner): Promise<void> {
+        // This migration will be auto-generated when you run:
+        // npm run migration:generate -- InitialMigration
+        
+        // Sessions table
+        await queryRunner.query(`
+            CREATE TABLE "sessions" (
+                "id" int IDENTITY(1,1) NOT NULL,
+                "session_name" varchar(255) NOT NULL,
+                "agent_name" varchar(255) NOT NULL,
+                "is_active" bit NOT NULL CONSTRAINT "DF_sessions_is_active" DEFAULT 1,
+                "last_connected" datetime NULL,
+                "connection_status" varchar(50) NOT NULL CONSTRAINT "DF_sessions_connection_status" DEFAULT 'inactive',
+                "created_at" datetime NOT NULL CONSTRAINT "DF_sessions_created_at" DEFAULT getdate(),
+                "updated_at" datetime NOT NULL CONSTRAINT "DF_sessions_updated_at" DEFAULT getdate(),
+                CONSTRAINT "UQ_sessions_session_name" UNIQUE ("session_name"),
+                CONSTRAINT "PK_sessions" PRIMARY KEY ("id")
+            )
+        `);
+
+        // Messages table
+        await queryRunner.query(`
+            CREATE TABLE "messages" (
+                "id" int IDENTITY(1,1) NOT NULL,
+                "message_id" varchar(255) NOT NULL,
+                "from_number" varchar(50) NOT NULL,
+                "to_number" varchar(50) NOT NULL,
+                "message_body" nvarchar(max) NULL,
+                "message_type" varchar(20) NOT NULL,
+                "is_group" bit NOT NULL CONSTRAINT "DF_messages_is_group" DEFAULT 0,
+                "group_id" varchar(100) NULL,
+                "timestamp" datetime NOT NULL CONSTRAINT "DF_messages_timestamp" DEFAULT getdate(),
+                "is_from_me" bit NOT NULL CONSTRAINT "DF_messages_is_from_me" DEFAULT 0,
+                "message_status" varchar(20) NOT NULL CONSTRAINT "DF_messages_message_status" DEFAULT 'pending',
+                "session_name" varchar(255) NOT NULL,
+                "media_url" varchar(500) NULL,
+                "media_filename" varchar(255) NULL,
+                "media_mimetype" varchar(100) NULL,
+                "media_size" bigint NULL,
+                "chat_id" varchar(255) NOT NULL,
+                "sender_name" varchar(255) NULL,
+                "participant_name" nvarchar(255) NULL,
+                "participant_phone" varchar(50) NULL,
+                "contact_pushname" nvarchar(255) NULL,
+                "is_reply" bit NOT NULL CONSTRAINT "DF_messages_is_reply" DEFAULT 0,
+                "quoted_message_id" varchar(255) NULL,
+                "quoted_message_body" nvarchar(max) NULL,
+                "quoted_message_from" varchar(255) NULL,
+                "quoted_message_type" varchar(50) NULL,
+                "quoted_message_timestamp" datetime NULL,
+                "created_at" datetime NOT NULL CONSTRAINT "DF_messages_created_at" DEFAULT getdate(),
+                "updated_at" datetime NOT NULL CONSTRAINT "DF_messages_updated_at" DEFAULT getdate(),
+                CONSTRAINT "UQ_messages_message_id" UNIQUE ("message_id"),
+                CONSTRAINT "PK_messages" PRIMARY KEY ("id")
+            )
+        `);
+
+        // Chats table
+        await queryRunner.query(`
+            CREATE TABLE "chats" (
+                "id" int IDENTITY(1,1) NOT NULL,
+                "chat_id" varchar(255) NOT NULL,
+                "chat_name" nvarchar(255) NULL,
+                "chat_type" varchar(20) NOT NULL,
+                "participant_number" varchar(50) NULL,
+                "group_name" nvarchar(255) NULL,
+                "last_message_id" varchar(255) NULL,
+                "last_message_text" nvarchar(max) NULL,
+                "last_message_time" datetime NULL,
+                "last_message_from" varchar(50) NULL,
+                "unread_count" int NOT NULL CONSTRAINT "DF_chats_unread_count" DEFAULT 0,
+                "is_active" bit NOT NULL CONSTRAINT "DF_chats_is_active" DEFAULT 1,
+                "session_name" varchar(255) NOT NULL,
+                "total_messages" int NOT NULL CONSTRAINT "DF_chats_total_messages" DEFAULT 0,
+                "last_reply_id" varchar(255) NULL,
+                "reply_count" int NOT NULL CONSTRAINT "DF_chats_reply_count" DEFAULT 0,
+                "created_at" datetime NOT NULL CONSTRAINT "DF_chats_created_at" DEFAULT getdate(),
+                "updated_at" datetime NOT NULL CONSTRAINT "DF_chats_updated_at" DEFAULT getdate(),
+                CONSTRAINT "PK_chats" PRIMARY KEY ("id")
+            )
+        `);
+
+        // Message Analytics table
+        await queryRunner.query(`
+            CREATE TABLE "message_analytics" (
+                "id" int IDENTITY(1,1) NOT NULL,
+                "session_name" varchar(255) NOT NULL,
+                "date_recorded" date NOT NULL,
+                "total_messages" int NOT NULL CONSTRAINT "DF_message_analytics_total_messages" DEFAULT 0,
+                "sent_messages" int NOT NULL CONSTRAINT "DF_message_analytics_sent_messages" DEFAULT 0,
+                "received_messages" int NOT NULL CONSTRAINT "DF_message_analytics_received_messages" DEFAULT 0,
+                "reply_messages" int NOT NULL CONSTRAINT "DF_message_analytics_reply_messages" DEFAULT 0,
+                "media_messages" int NOT NULL CONSTRAINT "DF_message_analytics_media_messages" DEFAULT 0,
+                "group_messages" int NOT NULL CONSTRAINT "DF_message_analytics_group_messages" DEFAULT 0,
+                "individual_messages" int NOT NULL CONSTRAINT "DF_message_analytics_individual_messages" DEFAULT 0,
+                "unique_contacts" int NOT NULL CONSTRAINT "DF_message_analytics_unique_contacts" DEFAULT 0,
+                "created_at" datetime NOT NULL CONSTRAINT "DF_message_analytics_created_at" DEFAULT getdate(),
+                CONSTRAINT "UQ_message_analytics_session_date" UNIQUE ("session_name", "date_recorded"),
+                CONSTRAINT "PK_message_analytics" PRIMARY KEY ("id")
+            )
+        `);
+
+        // Create indexes for better performance
+        await queryRunner.query(`CREATE INDEX "IDX_sessions_agent_name" ON "sessions" ("agent_name")`);
+        await queryRunner.query(`CREATE INDEX "IDX_sessions_is_active" ON "sessions" ("is_active")`);
+        await queryRunner.query(`CREATE INDEX "IDX_sessions_connection_status" ON "sessions" ("connection_status")`);
+
+        await queryRunner.query(`CREATE INDEX "IDX_messages_session_name" ON "messages" ("session_name")`);
+        await queryRunner.query(`CREATE INDEX "IDX_messages_chat_id" ON "messages" ("chat_id")`);
+        await queryRunner.query(`CREATE INDEX "IDX_messages_timestamp" ON "messages" ("timestamp")`);
+        await queryRunner.query(`CREATE INDEX "IDX_messages_message_status" ON "messages" ("message_status")`);
+        await queryRunner.query(`CREATE INDEX "IDX_messages_from_number" ON "messages" ("from_number")`);
+        await queryRunner.query(`CREATE INDEX "IDX_messages_to_number" ON "messages" ("to_number")`);
+        await queryRunner.query(`CREATE INDEX "IDX_messages_participant_phone" ON "messages" ("participant_phone")`);
+        await queryRunner.query(`CREATE INDEX "IDX_messages_participant_name" ON "messages" ("participant_name")`);
+        await queryRunner.query(`CREATE INDEX "IDX_messages_is_reply" ON "messages" ("is_reply")`);
+        await queryRunner.query(`CREATE INDEX "IDX_messages_quoted_message_id" ON "messages" ("quoted_message_id")`);
+
+        await queryRunner.query(`CREATE INDEX "IDX_chats_session_name" ON "chats" ("session_name")`);
+        await queryRunner.query(`CREATE INDEX "IDX_chats_chat_type" ON "chats" ("chat_type")`);
+        await queryRunner.query(`CREATE INDEX "IDX_chats_is_active" ON "chats" ("is_active")`);
+        await queryRunner.query(`CREATE INDEX "IDX_chats_last_message_time" ON "chats" ("last_message_time")`);
+        await queryRunner.query(`CREATE INDEX "IDX_chats_participant_number" ON "chats" ("participant_number")`);
+
+        await queryRunner.query(`CREATE INDEX "IDX_message_analytics_session_date" ON "message_analytics" ("session_name", "date_recorded")`);
+        await queryRunner.query(`CREATE INDEX "IDX_message_analytics_date" ON "message_analytics" ("date_recorded")`);
+    }
+
+    public async down(queryRunner: QueryRunner): Promise<void> {
+        // Drop indexes
+        await queryRunner.query(`DROP INDEX "IDX_message_analytics_date" ON "message_analytics"`);
+        await queryRunner.query(`DROP INDEX "IDX_message_analytics_session_date" ON "message_analytics"`);
+        await queryRunner.query(`DROP INDEX "IDX_chats_participant_number" ON "chats"`);
+        await queryRunner.query(`DROP INDEX "IDX_chats_last_message_time" ON "chats"`);
+        await queryRunner.query(`DROP INDEX "IDX_chats_is_active" ON "chats"`);
+        await queryRunner.query(`DROP INDEX "IDX_chats_chat_type" ON "chats"`);
+        await queryRunner.query(`DROP INDEX "IDX_chats_session_name" ON "chats"`);
+        await queryRunner.query(`DROP INDEX "IDX_messages_quoted_message_id" ON "messages"`);
+        await queryRunner.query(`DROP INDEX "IDX_messages_is_reply" ON "messages"`);
+        await queryRunner.query(`DROP INDEX "IDX_messages_participant_name" ON "messages"`);
+        await queryRunner.query(`DROP INDEX "IDX_messages_participant_phone" ON "messages"`);
+        await queryRunner.query(`DROP INDEX "IDX_messages_to_number" ON "messages"`);
+        await queryRunner.query(`DROP INDEX "IDX_messages_from_number" ON "messages"`);
+        await queryRunner.query(`DROP INDEX "IDX_messages_message_status" ON "messages"`);
+        await queryRunner.query(`DROP INDEX "IDX_messages_timestamp" ON "messages"`);
+        await queryRunner.query(`DROP INDEX "IDX_messages_chat_id" ON "messages"`);
+        await queryRunner.query(`DROP INDEX "IDX_messages_session_name" ON "messages"`);
+        await queryRunner.query(`DROP INDEX "IDX_sessions_connection_status" ON "sessions"`);
+        await queryRunner.query(`DROP INDEX "IDX_sessions_is_active" ON "sessions"`);
+        await queryRunner.query(`DROP INDEX "IDX_sessions_agent_name" ON "sessions"`);
+
+        // Drop tables
+        await queryRunner.query(`DROP TABLE "message_analytics"`);
+        await queryRunner.query(`DROP TABLE "chats"`);
+        await queryRunner.query(`DROP TABLE "messages"`);
+        await queryRunner.query(`DROP TABLE "sessions"`);
+    }
+}
+
+// src/utils/logger.ts
+export class Logger {
+  static info(message: string, ...args: any[]) {
+    console.log(`[INFO] ${new Date().toISOString()} - ${message}`, ...args);
+  }
+
+  static error(message: string, error?: any) {
+    console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, error);
+  }
+
+  static warn(message: string, ...args: any[]) {
+    console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, ...args);
+  }
+
+  static debug(message: string, ...args: any[]) {
+    if (process.env.NODE_ENV === 'development') {
+      console.log(`[DEBUG] ${new Date().toISOString()} - ${message}`, ...args);
+    }
+  }
+}
+
+// src/types/whatsapp.types.ts
+export interface WhatsAppMessage {
+  id: {
+    id: string;
+    fromMe: boolean;
+    remote: string;
+  };
+  body: string;
+  type: string;
+  timestamp: number;
+  from: string;
+  to: string;
+  fromMe: boolean;
+  hasMedia: boolean;
+  hasQuotedMsg: boolean;
+  author?: string;
+}
+
+export interface ParticipantInfo {
+  phone: string;
+  name?: string;
+  pushname?: string;
+  displayName: string;
+  isReply: boolean;
+  quotedMessageId?: string;
+  quotedMessageBody?: string;
+  quotedMessageFrom?: string;
+  quotedMessageType?: string;
+  quotedMessageTimestamp?: Date;
+}
+
+export interface MediaInfo {
+  filename: string;
+  filepath: string;
+  size: number;
+  mimetype: string;
+}
+
+// src/validators/message.validator.ts
+export class MessageValidator {
+  static validateSendMessage(data: any): { isValid: boolean; errors: string[] } {
+    const errors: string[] = [];
+
+    if (!data.phoneNumber || typeof data.phoneNumber !== 'string') {
+      errors.push('Phone number is required and must be a string');
+    }
+
+    if (!data.message || typeof data.message !== 'string') {
+      errors.push('Message is required and must be a string');
+    }
+
+    if (data.phoneNumber && !this.isValidPhoneNumber(data.phoneNumber)) {
+      errors.push('Invalid phone number format');
+    }
+
+    return {
+      isValid: errors.length === 0,
+      errors
+    };
+  }
+
+  static isValidPhoneNumber(phoneNumber: string): boolean {
+    // Basic phone number validation
+    const phoneRegex = /^[\+]?[0-9\s\-\(\)]+$/;
+    return phoneRegex.test(phoneNumber) && phoneNumber.replace(/\D/g, '').length >= 10;
+  }
+
+  static validateSessionName(sessionName: string): boolean {
+    return /^[a-zA-Z0-9_-]+$/.test(sessionName);
+  }
+}
+
+// .gitignore
+node_modules/
+dist/
+.env
+.env.local
+.env.production
+.env.staging
+sessions/
+media/
+uploads/
+logs/
+*.log
+*.sql
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+coverage/
+*.tgz
+*.tar.gz
+
+// README.md - Installation and Setup Guide
+# WhatsApp Tracker with TypeORM
+
+This is an enhanced version of the WhatsApp tracker using TypeORM for better database management, type safety, and maintainability.
+
+## Features
+
+- ✅ TypeORM integration with SQL Server
+- ✅ Type-safe database operations
+- ✅ Automatic database migrations
+- ✅ Enhanced error handling
+- ✅ Better performance with optimized queries
+- ✅ Real-time WebSocket events
+- ✅ Message reply support
+- ✅ Media file handling
+- ✅ Session management
+- ✅ Comprehensive logging
+
+## Installation
+
+1. **Clone the repository**
+   ```bash
+   git clone <repository-url>
+   cd whatsapp-tracker-typeorm
+   ```
+
+2. **Install dependencies**
+   ```bash
+   npm install
+   ```
+
+3. **Environment Setup**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your database configuration
+   ```
+
+4. **Database Setup**
+   ```bash
+   # Run migrations
+   npm run migration:run
+   
+   # Or sync schema (development only)
+   npm run schema:sync
+   ```
+
+5. **Build the project**
+   ```bash
+   npm run build
+   ```
+
+6. **Start the application**
+   ```bash
+   # Development
+   npm run dev
+   
+   # Production
+   npm start
+   ```
+
+## Project Structure
+
+```
+src/
+├── entities/          # TypeORM entities
+├── repositories/      # Custom repositories
+├── services/         # Business logic services
+├── database/         # Database configuration
+├── migrations/       # Database migrations
+├── config/          # Configuration files
+├── utils/           # Utility functions
+├── types/           # TypeScript type definitions
+├── validators/      # Input validation
+└── index.ts         # Main application file
+```
+
+## Database Migration Commands
+
+```bash
+# Generate new migration
+npm run migration:generate -- NewMigrationName
+
+# Run pending migrations
+npm run migration:run
+
+# Revert last migration
+npm run migration:revert
+
+# Sync schema (development only)
+npm run schema:sync
+
+# Drop all tables (be careful!)
+npm run schema:drop
+```
+
+## API Endpoints
+
+### Sessions
+- `GET /sessions` - Get all sessions with statistics
+- `GET /sessions/:sessionName` - Get specific session details
+- `POST /add-session?agentName=AgentName` - Create new session
+
+### Messages
+- `GET /messages` - Get messages with filtering
+- `GET /messages/search` - Search messages
+- `GET /messages/by-number/:number` - Get messages by phone number
+- `POST /send-message/:sessionName` - Send text message
+- `POST /send-media/:sessionName` - Send media message
+
+### Chats
+- `GET /chats/:sessionName` - Get chats for session
+- `GET /chats/:sessionName/:chatId/messages` - Get messages for specific chat
+
+## Development
+
+```bash
+# Watch mode for development
+npm run dev:watch
+
+# Type checking
+npx tsc --noEmit
+
+# Generate migration after entity changes
+npm run migration:generate -- DescriptiveName
+```
+
+## Environment Variables
+
+```env
+DB_TYPE=mssql
+DB_HOST=localhost
+DB_PORT=1433
+DB_USERNAME=your_username
+DB_PASSWORD=your_password
+DB_DATABASE=whatsap_tracker
+DB_ENCRYPT=false
+DB_TRUST_SERVER_CERTIFICATE=true
+NODE_ENV=development
+PORT=3001
+WHATSAPP_PORT=3002
+```
+
+## Benefits of TypeORM Migration
+
+1. **Type Safety**: Compile-time type checking for database operations
+2. **Better Performance**: Optimized queries and connection pooling
+3. **Maintainability**: Clean separation of concerns with repositories and services
+4. **Migrations**: Version-controlled database schema changes
+5. **Error Handling**: Better error messages and debugging
+6. **Query Builder**: Powerful and flexible query building
+7. **Relationships**: Easy management of table relationships
+8. **Validation**: Built-in validation for entities
+
+## Troubleshooting
+
+### Database Connection Issues
+- Verify SQL Server is running
+- Check connection credentials in .env
+- Ensure database exists
+- Check firewall settings
+
+### TypeScript Compilation Issues
+- Run `npm run build` to check for type errors
+- Ensure all dependencies are installed
+- Check tsconfig.json configuration
+
+### Migration Issues
+- Check migration files in src/migrations/
+- Verify database schema matches entities
+- Use `npm run schema:sync` for development (caution: drops data)
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make changes with proper TypeScript types
+4. Add tests if applicable
+5. Submit a pull request
+
+## License
+
+MIT License

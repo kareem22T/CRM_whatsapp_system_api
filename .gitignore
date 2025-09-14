@@ -1,0 +1,5 @@
+/node_modules
+/src/sessions/*
+!/src/sessions/.gitkeep
+/uploads/*
+!/uploads/.gitkeep
