@@ -10,11 +10,11 @@ import { Campaign } from '../entities/Campaign.ts';
 
 export const AppDataSource = new DataSource({
   type: 'mssql',
-  host: '192.168.1.149',
+  host: '67.211.221.109',
   port: 1433,
-  username: 'cyrus_crm_root',
-  password: 'Password',
-  database: 'crm_whatsapp',
+  username: 'Whatsapp@Cyrus',
+  password: 'apC31Wu@rssah2typ',
+  database: 'CRM_Whatsapp',
   synchronize: true,
   logging: false,
   entities: [Message, Session, Chat, MessageAnalytics, User, Contact, ContactGroup, MessageTemplate, Campaign],
