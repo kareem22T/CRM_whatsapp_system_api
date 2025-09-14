@@ -27,6 +27,7 @@ import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import { CampaignService } from './services/CampaignService.ts';
 import { ContactService } from './services/ContactService.ts';
+import { CampaignJobService } from './services/CampaignJobService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,6 +72,7 @@ let messageService: MessageService;
 let sessionService: SessionService;
 let chatService: ChatService;
 let contactService: ContactService;
+let campaignJobService: CampaignJobService;
 
 // Create media directory if it doesn't exist
 const mediaDir = path.join(__dirname, 'media');
@@ -1059,7 +1061,15 @@ app.get('/agent/:sessionName/status', (req, res) => {
   });
 });
 
-app.post('/start-campaign/:campaignId', async (req, res) => {
+// Add these endpoints to your main server file after the existing campaign endpoints
+
+// ========== CAMPAIGN PROGRESS TRACKING ENDPOINTS ==========
+
+/**
+ * Get progress for a specific campaign
+ * GET /campaign/:campaignId/progress
+ */
+app.get('/campaign/:campaignId/progress', async (req, res) => {
   const campaignId = parseInt(req.params.campaignId);
   
   if (!campaignId || isNaN(campaignId)) {
@@ -1071,52 +1081,109 @@ app.post('/start-campaign/:campaignId', async (req, res) => {
   }
 
   try {
-    // Get campaign with contact group, templates and session
-    const campaign = await campaignService.getCampaignById(campaignId);
+    const progressData = await campaignService.getCampaignProgress(campaignId);
     
-    if (!campaign) {
-      return res.status(404).json(createResponse(
-        false, 
-        null, 
-        'Campaign not found'
-      ));
-    }
+    res.json(createResponse(
+      true, 
+      progressData, 
+      'Campaign progress retrieved successfully'
+    ));
 
-    if (!campaign.contactGroup) {
-      return res.status(400).json(createResponse(
-        false, 
-        null, 
-        'Campaign has no contact group assigned'
-      ));
-    }
+  } catch (error: any) {
+    console.error('Error getting campaign progress:', error);
+    res.status(500).json(createResponse(
+      false, 
+      null, 
+      `Failed to get campaign progress: ${error.message}`
+    ));
+  }
+});
 
-    // Get contacts from the contact group
-    const contacts = await contactService.getContactsByGroup(campaign.groupId);
+/**
+ * Get progress for all campaigns (optionally filtered by session)
+ * GET /campaigns/progress?sessionId=123
+ */
+app.get('/campaigns/progress', async (req, res) => {
+  const sessionId = req.query.sessionId ? parseInt(req.query.sessionId as string) : undefined;
+
+  try {
+    const progressData = await campaignService.getAllCampaignsProgress(sessionId);
     
-    if (!contacts || contacts.length === 0) {
-      return res.status(400).json(createResponse(
-        false, 
-        null, 
-        'Contact group has no contacts'
-      ));
-    }
+    res.json(createResponse(
+      true, 
+      {
+        campaigns: progressData,
+        totalCampaigns: progressData.length,
+        sessionId: sessionId || null
+      }, 
+      `Retrieved progress for ${progressData.length} campaigns`
+    ));
 
-    if (!campaign.templates || campaign.templates.length === 0) {
-      return res.status(400).json(createResponse(
-        false, 
-        null, 
-        'Campaign has no templates'
-      ));
-    }
+  } catch (error: any) {
+    console.error('Error getting campaigns progress:', error);
+    res.status(500).json(createResponse(
+      false, 
+      null, 
+      `Failed to get campaigns progress: ${error.message}`
+    ));
+  }
+});
 
-    if (!campaign.session) {
-      return res.status(400).json(createResponse(
-        false, 
-        null, 
-        'Campaign has no associated session'
-      ));
-    }
+/**
+ * Get detailed job statistics for a campaign
+ * GET /campaign/:campaignId/job-stats
+ */
+app.get('/campaign/:campaignId/job-stats', async (req, res) => {
+  const campaignId = parseInt(req.params.campaignId);
+  
+  if (!campaignId || isNaN(campaignId)) {
+    return res.status(400).json(createResponse(
+      false, 
+      null, 
+      'Valid campaign ID is required'
+    ));
+  }
 
+  try {
+    const jobStats = await campaignService.getCampaignJobStats(campaignId);
+    
+    res.json(createResponse(
+      true, 
+      jobStats, 
+      'Campaign job statistics retrieved successfully'
+    ));
+
+  } catch (error: any) {
+    console.error('Error getting campaign job stats:', error);
+    res.status(500).json(createResponse(
+      false, 
+      null, 
+      `Failed to get job statistics: ${error.message}`
+    ));
+  }
+});
+
+// ========== CAMPAIGN CONTROL ENDPOINTS ==========
+
+/**
+ * Start a campaign (enhanced version)
+ * POST /campaign/:campaignId/start
+ */
+app.post('/campaign/:campaignId/start', async (req, res) => {
+  const campaignId = parseInt(req.params.campaignId);
+  
+  if (!campaignId || isNaN(campaignId)) {
+    return res.status(400).json(createResponse(
+      false, 
+      null, 
+      'Valid campaign ID is required'
+    ));
+  }
+
+  try {
+    // Start campaign and create jobs
+    const { campaign, jobs, totalJobs } = await campaignService.startCampaign(campaignId);
+    
     // Check if session is ready
     if (!isClientReady(campaign.session.sessionName)) {
       return res.status(400).json(createResponse(
@@ -1126,88 +1193,66 @@ app.post('/start-campaign/:campaignId', async (req, res) => {
       ));
     }
 
-    let cumulativeDelay = 0;
+    // Schedule all jobs in Bull queue
     const jobsScheduled = [];
-
-    // Loop through contacts and create jobs
-    for (let i = 0; i < contacts.length; i++) {
-      const contact = contacts[i];
-      
-      // Generate random delay between min and max intervals (in minutes) for EACH job
-      const randomDelayMinutes = Math.floor(
-        Math.random() * (campaign.maxIntervalMinutes - campaign.minIntervalMinutes + 1)
-      ) + campaign.minIntervalMinutes;
-      
-      // Convert to milliseconds and add to cumulative delay to ensure jobs run in sequence
-      const randomDelayMs = randomDelayMinutes * 60 * 1000;
-      cumulativeDelay += randomDelayMs;
-
-      // Select random template
-      const randomTemplateIndex = Math.floor(Math.random() * campaign.templates.length);
-      const selectedTemplate = campaign.templates[randomTemplateIndex];
-
-      // Create job data
+    for (const job of jobs) {
+      // Create job data for Bull queue
       const jobData = {
-        contactId: contact.id,
-        contactPhone: contact.phone,
-        templateId: selectedTemplate.id,
-        templateMessage: selectedTemplate.message,
-        campaignId: campaign.id,
+        campaignJobId: job.id,
+        contactId: job.contactId,
+        contactPhone: job.contactPhone,
+        templateId: job.templateId,
+        templateMessage: job.templateMessage,
+        campaignId: job.campaignId,
         campaignName: campaign.name,
-        sessionName: campaign.session.sessionName,
-        delayMinutes: randomDelayMinutes
+        sessionName: job.sessionName,
+        delayMinutes: job.delayMinutes
       };
 
-      // Schedule job with cumulative delay
-      await jobQueue.add('send-campaign-message', jobData, {
-        delay: cumulativeDelay,
+      // Schedule job with delay
+      const queueJob = await jobQueue.add('send-campaign-message', jobData, {
+        delay: job.scheduledAt.getTime() - Date.now(),
         removeOnComplete: true,
         removeOnFail: false,
         attempts: 3,
         backoff: {
           type: 'exponential',
-          delay: 30000, // 30 seconds
+          delay: 30000
         }
       });
 
-      jobsScheduled.push({
-        contactId: contact.id,
-        contactName: contact.name,
-        contactPhone: contact.phone,
-        templateId: selectedTemplate.id,
-        templateName: selectedTemplate.name,
-        delayMinutes: randomDelayMinutes,
-        scheduledAt: new Date(Date.now() + cumulativeDelay).toISOString()
-      });
+      // Update job record with queue job ID
+      await campaignService.updateJobWithQueueId(job.id, String(queueJob.id));
 
-      console.log(`📅 Job scheduled for contact ${contact.name} (${contact.phone}) with template "${selectedTemplate.name}" in ${Math.floor(cumulativeDelay / 60000)} minutes`);
+      jobsScheduled.push({
+        jobId: job.id,
+        queueJobId: queueJob.id,
+        contactPhone: job.contactPhone,
+        scheduledAt: job.scheduledAt.toISOString(),
+        delayMinutes: job.delayMinutes
+      });
     }
 
-    // Update campaign last sent time
-    await campaignService.updateLastSent(campaignId);
-    await campaignService.updateIsStarted(campaignId, true);
-
-    console.log(`✅ Campaign "${campaign.name}" started with ${jobsScheduled.length} jobs scheduled`);
+    console.log(`Campaign "${campaign.name}" started with ${totalJobs} jobs scheduled`);
 
     res.json(createResponse(
       true, 
       {
         campaignId: campaign.id,
         campaignName: campaign.name,
+        status: campaign.status,
         sessionName: campaign.session.sessionName,
-        groupId: campaign.groupId,
-        groupName: campaign.contactGroup.name,
-        totalContacts: contacts.length,
-        totalTemplates: campaign.templates.length,
+        totalContacts: totalJobs,
+        progressPercentage: campaign.progressPercentage,
+        estimatedCompletionAt: campaign.estimatedCompletionAt,
         jobsScheduled: jobsScheduled.length,
-        estimatedCompletionTime: new Date(Date.now() + cumulativeDelay).toISOString(),
-        jobs: jobsScheduled
+        nextSendAt: campaign.nextSendAt
       }, 
-      `Campaign started successfully with ${jobsScheduled.length} messages scheduled`
+      `Campaign started successfully with ${totalJobs} messages scheduled`
     ));
 
   } catch (error: any) {
-    console.error('Error starting campaign:', error);
+    console.error('Error starting enhanced campaign:', error);
     res.status(500).json(createResponse(
       false, 
       null, 
@@ -1215,9 +1260,136 @@ app.post('/start-campaign/:campaignId', async (req, res) => {
     ));
   }
 });
-// Job worker for campaign messages
+
+/**
+ * Pause a running campaign
+ * POST /campaign/:campaignId/pause
+ */
+app.post('/campaign/:campaignId/pause', async (req, res) => {
+  const campaignId = parseInt(req.params.campaignId);
+  
+  if (!campaignId || isNaN(campaignId)) {
+    return res.status(400).json(createResponse(
+      false, 
+      null, 
+      'Valid campaign ID is required'
+    ));
+  }
+
+  try {
+    const campaign = await campaignService.pauseCampaign(campaignId);
+    
+    res.json(createResponse(
+      true, 
+      {
+        campaignId: campaign.id,
+        campaignName: campaign.name,
+        status: campaign.status,
+        pausedAt: campaign.pausedAt,
+        progressPercentage: campaign.progressPercentage
+      }, 
+      'Campaign paused successfully'
+    ));
+
+  } catch (error: any) {
+    console.error('Error pausing campaign:', error);
+    res.status(500).json(createResponse(
+      false, 
+      null, 
+      `Failed to pause campaign: ${error.message}`
+    ));
+  }
+});
+
+/**
+ * Resume a paused campaign
+ * POST /campaign/:campaignId/resume
+ */
+app.post('/campaign/:campaignId/resume', async (req, res) => {
+  const campaignId = parseInt(req.params.campaignId);
+  
+  if (!campaignId || isNaN(campaignId)) {
+    return res.status(400).json(createResponse(
+      false, 
+      null, 
+      'Valid campaign ID is required'
+    ));
+  }
+
+  try {
+    const campaign = await campaignService.resumeCampaign(campaignId);
+    
+    res.json(createResponse(
+      true, 
+      {
+        campaignId: campaign.id,
+        campaignName: campaign.name,
+        status: campaign.status,
+        progressPercentage: campaign.progressPercentage,
+        nextSendAt: campaign.nextSendAt
+      }, 
+      'Campaign resumed successfully'
+    ));
+
+  } catch (error: any) {
+    console.error('Error resuming campaign:', error);
+    res.status(500).json(createResponse(
+      false, 
+      null, 
+      `Failed to resume campaign: ${error.message}`
+    ));
+  }
+});
+
+/**
+ * Cancel a campaign
+ * POST /campaign/:campaignId/cancel
+ */
+app.post('/campaign/:campaignId/cancel', async (req, res) => {
+  const campaignId = parseInt(req.params.campaignId);
+  
+  if (!campaignId || isNaN(campaignId)) {
+    return res.status(400).json(createResponse(
+      false, 
+      null, 
+      'Valid campaign ID is required'
+    ));
+  }
+
+  try {
+    const campaign = await campaignService.cancelCampaign(campaignId);
+    
+    res.json(createResponse(
+      true, 
+      {
+        campaignId: campaign.id,
+        campaignName: campaign.name,
+        status: campaign.status,
+        completedAt: campaign.completedAt,
+        finalProgressPercentage: campaign.progressPercentage
+      }, 
+      'Campaign cancelled successfully'
+    ));
+
+  } catch (error: any) {
+    console.error('Error cancelling campaign:', error);
+    res.status(500).json(createResponse(
+      false, 
+      null, 
+      `Failed to cancel campaign: ${error.message}`
+    ));
+  }
+});
+
+// ========== UPDATED CAMPAIGN WORKER ==========
+
+/**
+ * Enhanced campaign worker with progress tracking
+ * Update the existing campaignWorker to include progress updates
+ */
 const campaignWorker = new Worker('send-campaign-message', async (job) => {
   const { 
+    campaignJobId,
     contactId, 
     contactPhone, 
     templateId, 
@@ -1228,7 +1400,14 @@ const campaignWorker = new Worker('send-campaign-message', async (job) => {
   } = job.data;
 
   try {
-    console.log(`🚀 Processing campaign message job: Contact ${contactPhone}, Template ${templateId}`);
+    console.log(`Processing enhanced campaign message job: Contact ${contactPhone}, Template ${templateId}`);
+
+    // Update job status to processing
+    await campaignService.updateCampaignJobProgress(campaignId, {
+      jobId: String(job.id),
+      status: 'processing',
+      processingStartedAt: new Date()
+    });
 
     // Check if session is still ready
     if (!isClientReady(sessionName)) {
@@ -1242,12 +1421,20 @@ const campaignWorker = new Worker('send-campaign-message', async (job) => {
       templateMessage
     );
 
-    console.log(`✅ Campaign message sent successfully to ${contactPhone} via ${sessionName}`);
-    console.log(`📊 Campaign "${campaignName}" - Message sent to contact ${contactId} using template ${templateId}`);
-    console.log(`Sent template ${templateId} to contact ${contactId} at ${new Date()}`);
+    // Update job status to completed with success
+    await campaignService.updateCampaignJobProgress(campaignId, {
+      jobId: String(job.id),
+      status: 'completed',
+      whatsappMessageId: result.messageId,
+      processedAt: new Date()
+    });
+
+    console.log(`Campaign message sent successfully to ${contactPhone} via ${sessionName}`);
+    console.log(`Campaign "${campaignName}" - Message sent to contact ${contactId} using template ${templateId}`);
 
     return {
       success: true,
+      campaignJobId,
       contactId,
       contactPhone,
       templateId,
@@ -1256,12 +1443,291 @@ const campaignWorker = new Worker('send-campaign-message', async (job) => {
     };
 
   } catch (error: any) {
-    console.error(`❌ Failed to send campaign message to ${contactPhone}:`, error);
-    console.log(`📊 Campaign "${campaignName}" - Failed to send message to contact ${contactId}: ${error.message}`);
+    console.error(`Failed to send campaign message to ${contactPhone}:`, error);
+    
+    // Update job status to failed
+    await campaignService.updateCampaignJobProgress(campaignId, {
+      jobId: String(job.id),
+      status: 'failed',
+      errorMessage: error.message,
+      processedAt: new Date()
+    });
+
+    console.log(`Campaign "${campaignName}" - Failed to send message to contact ${contactId}: ${error.message}`);
     
     throw error;
   }
 }, { connection });
+
+// ========== DASHBOARD SUMMARY ENDPOINTS ==========
+
+/**
+ * Get campaign dashboard summary
+ * GET /campaigns/dashboard?sessionId=123
+ */
+app.get('/campaigns/dashboard', async (req, res) => {
+  const sessionId = req.query.sessionId ? parseInt(req.query.sessionId as string) : undefined;
+
+  try {
+    const progressData = await campaignService.getAllCampaignsProgress(sessionId);
+    
+    // Calculate summary statistics
+    const summary = {
+      totalCampaigns: progressData.length,
+      activeCampaigns: progressData.filter(c => c.isActive).length,
+      completedCampaigns: progressData.filter(c => c.isCompleted).length,
+      runningCampaigns: progressData.filter(c => c.status === 'running').length,
+      pausedCampaigns: progressData.filter(c => c.status === 'paused').length,
+      totalContacts: progressData.reduce((sum, c) => sum + c.totalContacts, 0),
+      totalMessagesSent: progressData.reduce((sum, c) => sum + c.messagesSent, 0),
+      totalMessagesFailed: progressData.reduce((sum, c) => sum + c.messagesFailed, 0),
+      totalMessagesPending: progressData.reduce((sum, c) => sum + c.messagesPending, 0),
+      overallSuccessRate: 0,
+      nextScheduledSends: progressData
+        .filter(c => c.nextSendAt)
+        .sort((a, b) => new Date(a.nextSendAt!).getTime() - new Date(b.nextSendAt!).getTime())
+        .slice(0, 5)
+        .map(c => ({
+          campaignId: c.campaignId,
+          campaignName: c.campaignName,
+          nextSendAt: c.nextSendAt
+        }))
+    };
+
+    // Calculate overall success rate
+    const totalProcessed = summary.totalMessagesSent + summary.totalMessagesFailed;
+    if (totalProcessed > 0) {
+      summary.overallSuccessRate = (summary.totalMessagesSent / totalProcessed) * 100;
+    }
+
+    res.json(createResponse(
+      true, 
+      {
+        summary,
+        campaigns: progressData
+      }, 
+      'Campaign dashboard data retrieved successfully'
+    ));
+
+  } catch (error: any) {
+    console.error('Error getting campaign dashboard:', error);
+    res.status(500).json(createResponse(
+      false, 
+      null, 
+      `Failed to get dashboard data: ${error.message}`
+    ));
+  }
+});
+
+/**
+ * Get real-time campaign status updates
+ * GET /campaign/:campaignId/status
+ */
+app.get('/campaign/:campaignId/status', async (req, res) => {
+  const campaignId = parseInt(req.params.campaignId);
+  
+  if (!campaignId || isNaN(campaignId)) {
+    return res.status(400).json(createResponse(
+      false, 
+      null, 
+      'Valid campaign ID is required'
+    ));
+  }
+
+  try {
+    const [progressData, jobStats] = await Promise.all([
+      campaignService.getCampaignProgress(campaignId),
+      campaignService.getCampaignJobStats(campaignId)
+    ]);
+    
+    res.json(createResponse(
+      true, 
+      {
+        progress: progressData,
+        jobStatistics: jobStats,
+        lastUpdated: new Date().toISOString()
+      }, 
+      'Campaign status retrieved successfully'
+    ));
+
+  } catch (error: any) {
+    console.error('Error getting campaign status:', error);
+    res.status(500).json(createResponse(
+      false, 
+      null, 
+      `Failed to get campaign status: ${error.message}`
+    ));
+  }
+});
+
+app.get('/campaign/:campaignId/jobs', async (req, res) => {
+  const campaignId = parseInt(req.params.campaignId);
+  const status = req.query.status as string;
+  const page = parseInt(req.query.page as string) || 1;
+  const limit = parseInt(req.query.limit as string) || 50;
+  const orderBy = req.query.orderBy as 'scheduledAt' | 'processedAt' | 'createdAt' || 'scheduledAt';
+  const orderDirection = req.query.orderDirection as 'ASC' | 'DESC' || 'ASC';
+  
+  if (!campaignId || isNaN(campaignId)) {
+    return res.status(400).json(createResponse(
+      false, 
+      null, 
+      'Valid campaign ID is required'
+    ));
+  }
+
+  try {
+    const { jobs, total } = await campaignJobService.getCampaignJobs(campaignId, {
+      status,
+      page,
+      limit,
+      orderBy,
+      orderDirection
+    });
+    
+    res.json(createResponse(
+      true, 
+      {
+        jobs,
+        pagination: {
+          currentPage: page,
+          totalPages: Math.ceil(total / limit),
+          totalItems: total,
+          itemsPerPage: limit
+        }
+      }, 
+      `Retrieved ${jobs.length} jobs for campaign ${campaignId}`
+    ));
+
+  } catch (error: any) {
+    console.error('Error getting campaign jobs:', error);
+    res.status(500).json(createResponse(
+      false, 
+      null, 
+      `Failed to get campaign jobs: ${error.message}`
+    ));
+  }
+});
+
+// Endpoint for job timeline
+app.get('/campaign/:campaignId/timeline', async (req, res) => {
+  const campaignId = parseInt(req.params.campaignId);
+  
+  if (!campaignId || isNaN(campaignId)) {
+    return res.status(400).json(createResponse(
+      false, 
+      null, 
+      'Valid campaign ID is required'
+    ));
+  }
+
+  try {
+    const timeline = await campaignJobService.getCampaignJobTimeline(campaignId);
+    
+    res.json(createResponse(
+      true, 
+      timeline, 
+      'Campaign timeline retrieved successfully'
+    ));
+
+  } catch (error: any) {
+    console.error('Error getting campaign timeline:', error);
+    res.status(500).json(createResponse(
+      false, 
+      null, 
+      `Failed to get campaign timeline: ${error.message}`
+    ));
+  }
+});
+
+// Endpoint to retry failed jobs
+app.post('/campaign-job/:jobId/retry', async (req, res) => {
+  const jobId = parseInt(req.params.jobId);
+  
+  if (!jobId || isNaN(jobId)) {
+    return res.status(400).json(createResponse(
+      false, 
+      null, 
+      'Valid job ID is required'
+    ));
+  }
+
+  try {
+    const retriedJob = await campaignJobService.retryFailedJob(jobId);
+    
+    // Re-schedule the job in the queue
+    const jobData = {
+      campaignJobId: retriedJob.id,
+      contactId: retriedJob.contactId,
+      contactPhone: retriedJob.contactPhone,
+      templateId: retriedJob.templateId,
+      templateMessage: retriedJob.templateMessage,
+      campaignId: retriedJob.campaignId,
+      campaignName: `Campaign ${retriedJob.campaignId}`, // You might want to fetch the actual campaign name
+      sessionName: retriedJob.sessionName,
+      delayMinutes: 0 // Immediate retry
+    };
+
+    const queueJob = await jobQueue.add('send-campaign-message', jobData, {
+      delay: 0, // Immediate retry
+      removeOnComplete: true,
+      removeOnFail: false,
+      attempts: 1 // Single retry attempt
+    });
+
+    // Update job with new queue ID
+    await campaignJobService.updateJobWithQueueId(retriedJob.id, String(queueJob.id));
+    
+    res.json(createResponse(
+      true, 
+      {
+        jobId: retriedJob.id,
+        queueJobId: queueJob.id,
+        retryCount: retriedJob.retryCount,
+        maxRetries: retriedJob.maxRetries,
+        scheduledAt: retriedJob.scheduledAt
+      }, 
+      `Job ${jobId} scheduled for retry (attempt ${retriedJob.retryCount}/${retriedJob.maxRetries})`
+    ));
+
+  } catch (error: any) {
+    console.error('Error retrying job:', error);
+    res.status(500).json(createResponse(
+      false, 
+      null, 
+      `Failed to retry job: ${error.message}`
+    ));
+  }
+});
+
+// WebSocket events for real-time campaign progress updates
+function emitCampaignProgress(campaignId: number, progressData: any) {
+  const eventData = {
+    campaignId,
+    ...progressData,
+    timestamp: new Date().toISOString()
+  };
+
+  io.emit('campaign-progress-update', eventData);
+  io.emit(`campaign-${campaignId}`, { type: 'progress-update', ...eventData });
+
+  console.log(`📡 Real-time campaign progress emitted: Campaign ${campaignId} - ${progressData.progressPercentage}%`);
+}
+
+function emitCampaignStatusChange(campaignId: number, oldStatus: string, newStatus: string) {
+  const eventData = {
+    campaignId,
+    oldStatus,
+    newStatus,
+    timestamp: new Date().toISOString()
+  };
+
+  io.emit('campaign-status-change', eventData);
+  io.emit(`campaign-${campaignId}`, { type: 'status-change', ...eventData });
+
+  console.log(`📡 Real-time campaign status change emitted: Campaign ${campaignId} - ${oldStatus} -> ${newStatus}`);
+}
+
 
 // Start server
 server.listen(3002, () => {
@@ -1285,6 +1751,7 @@ async function main(): Promise<void> {
     sessionService = new SessionService();
     chatService = new ChatService();
     contactService = new ContactService();
+    campaignJobService = new CampaignJobService(dbManager.dataSource);
     
     // Load all sessions
     await loadAllAgentSessions();

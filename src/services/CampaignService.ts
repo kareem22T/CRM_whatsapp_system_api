@@ -4,6 +4,7 @@ import { Campaign } from '../entities/Campaign';
 import { Contact, ContactGroup } from '../entities/Contact';
 import { MessageTemplate } from '../entities/MessageTemplate';
 import { Session } from '../entities/Session';
+import { CampaignJob } from '../entities/CampaignJob';
 
 // DTOs for Campaign operations
 export interface CreateCampaignDto {
@@ -37,12 +38,42 @@ export interface CampaignQueryOptions {
   status?: string;
 }
 
+export interface CampaignProgressDto {
+  campaignId: number;
+  campaignName: string;
+  status: string;
+  totalContacts: number;
+  messagesSent: number;
+  messagesFailed: number;
+  messagesPending: number;
+  progressPercentage: number;
+  successRate: number;
+  nextSendAt: Date | null;
+  startedAt: Date | null;
+  completedAt: Date | null;
+  estimatedCompletionAt: Date | null;
+  remainingContacts: number;
+  lastSent: Date | null;
+  isCompleted: boolean;
+  isActive: boolean;
+}
+
+export interface CampaignJobUpdate {
+  jobId: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
+  whatsappMessageId?: string;
+  errorMessage?: string;
+  processingStartedAt?: Date;
+  processedAt?: Date;
+}
+
 export class CampaignService {
   private campaignRepository: CampaignRepository;
   private contactRepository: Repository<Contact>;
   private contactGroupRepository: Repository<ContactGroup>;
   private templateRepository: Repository<MessageTemplate>;
   private sessionRepository: Repository<Session>;
+  private campaignJobRepository: Repository<CampaignJob>;
   private dataSource: DataSource;
 
   constructor(dataSource: DataSource) {
@@ -52,164 +83,490 @@ export class CampaignService {
     this.contactGroupRepository = dataSource.getRepository(ContactGroup);
     this.templateRepository = dataSource.getRepository(MessageTemplate);
     this.sessionRepository = dataSource.getRepository(Session);
+    this.campaignJobRepository = dataSource.getRepository(CampaignJob);
   }
 
-  // Create Campaign with relations
-  async createCampaign(createCampaignDto: CreateCampaignDto): Promise<Campaign> {
+  // ========== PROGRESS TRACKING METHODS ==========
+
+  /**
+   * Update campaign progress when a job is created
+   */
+  async initializeCampaignProgress(campaignId: number, totalJobs: number): Promise<Campaign> {
+    try {
+      const campaign = await this.getCampaignById(campaignId);
+      
+      campaign.totalContacts = totalJobs;
+      campaign.messagesPending = totalJobs;
+      campaign.messagesSent = 0;
+      campaign.messagesFailed = 0;
+      campaign.progressPercentage = 0;
+      campaign.status = 'running';
+      campaign.startedAt = new Date();
+      
+      // Calculate estimated completion time
+      const avgIntervalMinutes = (campaign.minIntervalMinutes + campaign.maxIntervalMinutes) / 2;
+      const estimatedTotalMinutes = totalJobs * avgIntervalMinutes;
+      campaign.estimatedCompletionAt = new Date(Date.now() + (estimatedTotalMinutes * 60 * 1000));
+      
+      const updatedCampaign = await this.campaignRepository.save(campaign);
+      console.log(`📊 Initialized campaign progress: ${campaign.name} - ${totalJobs} total jobs`);
+      
+      return updatedCampaign;
+    } catch (error) {
+      console.error('Error initializing campaign progress:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update campaign progress when a job completes (success or failure)
+   */
+  async updateCampaignJobProgress(campaignId: number, jobUpdate: CampaignJobUpdate): Promise<Campaign> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
-      console.log(`🚀 Creating new campaign: ${createCampaignDto.name}`);
+      // Update the job record
+      const job = await this.campaignJobRepository.findOne({
+        where: { queueJobId: jobUpdate.jobId }
+      });
 
-      // ✅ Validate session
-      if (createCampaignDto.sessionId) {
-        const session = await this.sessionRepository.findOne({
-          where: { id: createCampaignDto.sessionId }
-        });
-        if (!session) {
-          throw new Error(`Session with ID ${createCampaignDto.sessionId} not found`);
-        }
-        console.log(`✅ Session validated: ${session.sessionName}`);
+      if (job) {
+        job.status = jobUpdate.status;
+        job.whatsappMessageId = jobUpdate.whatsappMessageId || job.whatsappMessageId;
+        job.errorMessage = jobUpdate.errorMessage || job.errorMessage;
+        job.processingStartedAt = jobUpdate.processingStartedAt || job.processingStartedAt;
+        job.processedAt = jobUpdate.processedAt || job.processedAt;
+        
+        await queryRunner.manager.save(job);
       }
 
-      // ✅ Validate contact group
-      if (createCampaignDto.groupId) {
-        const group = await this.contactGroupRepository.findOne({
-          where: { id: createCampaignDto.groupId }
-        });
-        if (!group) {
-          throw new Error(`Contact group with ID ${createCampaignDto.groupId} not found`);
-        }
-        console.log(`✅ Contact group validated: ${group.name}`);
+      // Get current campaign
+      const campaign = await queryRunner.manager.findOne(Campaign, {
+        where: { id: campaignId }
+      });
+
+      if (!campaign) {
+        throw new Error(`Campaign with ID ${campaignId} not found`);
       }
 
-      // ✅ Create campaign entity
-      const campaign = queryRunner.manager.create(Campaign, {
-        name: createCampaignDto.name,
-        description: createCampaignDto.description,
-        minIntervalMinutes: createCampaignDto.minIntervalMinutes ?? 30,
-        maxIntervalMinutes: createCampaignDto.maxIntervalMinutes ?? 120,
-        sessionId: createCampaignDto.sessionId,
-        groupId: createCampaignDto.groupId,
-      } as DeepPartial<Campaign>);
+      // Recalculate progress based on all jobs
+      const jobStats = await queryRunner.manager
+        .createQueryBuilder(CampaignJob, 'job')
+        .select('job.status', 'status')
+        .addSelect('COUNT(*)', 'count')
+        .where('job.campaignId = :campaignId', { campaignId })
+        .groupBy('job.status')
+        .getRawMany();
 
-      const savedCampaign = await queryRunner.manager.save(campaign);
-      console.log(`✅ Campaign created with ID: ${savedCampaign.id}`);
+      let messagesSent = 0;
+      let messagesFailed = 0;
+      let messagesPending = 0;
 
-      // ✅ Handle templates
-      if (createCampaignDto.templateIds && createCampaignDto.templateIds.length > 0) {
-        const templates = await this.templateRepository.find({
-          where: { id: In(createCampaignDto.templateIds) }
-        });
-
-        if (templates.length !== createCampaignDto.templateIds.length) {
-          const foundIds = templates.map(t => t.id);
-          const missingIds = createCampaignDto.templateIds.filter(id => !foundIds.includes(id));
-          throw new Error(`Templates not found with IDs: ${missingIds.join(', ')}`);
+      jobStats.forEach(stat => {
+        const count = parseInt(stat.count);
+        switch (stat.status) {
+          case 'completed':
+            messagesSent += count;
+            break;
+          case 'failed':
+            messagesFailed += count;
+            break;
+          case 'pending':
+          case 'processing':
+            messagesPending += count;
+            break;
         }
+      });
 
-        savedCampaign.templates = templates;
-        console.log(`✅ Added ${templates.length} templates to campaign`);
+      // Update campaign progress
+      campaign.messagesSent = messagesSent;
+      campaign.messagesFailed = messagesFailed;
+      campaign.messagesPending = messagesPending;
+      campaign.lastSent = new Date();
+      
+      // Calculate progress percentage
+      const totalProcessed = messagesSent + messagesFailed;
+      const progressPercentage = campaign.totalContacts > 0 
+        ? (totalProcessed / campaign.totalContacts) * 100 
+        : 0;
+      campaign.progressPercentage = Math.round(progressPercentage * 100) / 100; // Round to 2 decimal places
+
+      // Update next send time (find next pending job)
+      const nextPendingJob = await queryRunner.manager.findOne(CampaignJob, {
+        where: { 
+          campaignId,
+          status: 'pending'
+        },
+        order: { scheduledAt: 'ASC' }
+      });
+      
+      campaign.nextSendAt = nextPendingJob?.scheduledAt || null;
+
+      // Check if campaign is completed
+      if (messagesPending === 0) {
+        campaign.status = 'completed';
+        campaign.completedAt = new Date();
+        campaign.nextSendAt = null;
+        console.log(`🎉 Campaign completed: ${campaign.name}`);
       }
 
-      // ✅ Save with relations
-      const finalCampaign = await queryRunner.manager.save(savedCampaign);
+      const updatedCampaign = await queryRunner.manager.save(campaign);
       await queryRunner.commitTransaction();
 
-      console.log(`🎉 Campaign created successfully: ${finalCampaign.name}`);
-      return this.getCampaignById(finalCampaign.id);
-
+      const completionText = campaign.status === 'completed' ? ' - COMPLETED!' : '';
+      console.log(`📊 Campaign progress updated: ${campaign.name} - ${progressPercentage.toFixed(2)}%${completionText}`);
+      console.log(`   ✅ Sent: ${messagesSent} | ❌ Failed: ${messagesFailed} | ⏳ Pending: ${messagesPending}`);
+      
+      return updatedCampaign;
     } catch (error) {
       await queryRunner.rollbackTransaction();
-      console.error('Error creating campaign:', error);
+      console.error('Error updating campaign progress:', error);
       throw error;
     } finally {
       await queryRunner.release();
     }
   }
 
-  // Get all campaigns with optional filtering
-  async getCampaigns(options: CampaignQueryOptions = {}): Promise<{ campaigns: Campaign[]; total: number }> {
+  /**
+   * Get comprehensive campaign progress data
+   */
+  async getCampaignProgress(campaignId: number): Promise<CampaignProgressDto> {
     try {
-      const campaigns = await this.campaignRepository.findAllWithRelations(options);
+      const campaign = await this.getCampaignById(campaignId);
       
-      // Get total count for pagination
-      const whereCondition: any = {};
-      if (options.sessionId) whereCondition.sessionId = options.sessionId;
-      if (options.isActive !== undefined) whereCondition.isActive = options.isActive;
-      if (options.status) whereCondition.status = options.status;
-
-      const total = await this.campaignRepository.count({ where: whereCondition });
-
-      console.log(`📊 Found ${campaigns.length} campaigns (total: ${total})`);
-      return { campaigns, total };
+      return {
+        campaignId: campaign.id,
+        campaignName: campaign.name,
+        status: campaign.status,
+        totalContacts: campaign.totalContacts,
+        messagesSent: campaign.messagesSent,
+        messagesFailed: campaign.messagesFailed,
+        messagesPending: campaign.messagesPending,
+        progressPercentage: campaign.progressPercentage,
+        successRate: campaign.successRate,
+        nextSendAt: campaign.nextSendAt,
+        startedAt: campaign.startedAt,
+        completedAt: campaign.completedAt,
+        estimatedCompletionAt: campaign.estimatedCompletionAt,
+        remainingContacts: campaign.remainingContacts,
+        lastSent: campaign.lastSent,
+        isCompleted: campaign.isCompleted,
+        isActive: campaign.isActive
+      };
     } catch (error) {
-      console.error('Error getting campaigns:', error);
-      
-      // Fallback to simple query
-      const whereCondition: any = {};
-      if (options.sessionId) whereCondition.sessionId = options.sessionId;
-      if (options.isActive !== undefined) whereCondition.isActive = options.isActive;
-      if (options.status) whereCondition.status = options.status;
-
-      const skip = ((options.page || 1) - 1) * (options.limit || 50);
-      
-      const [campaigns, total] = await this.campaignRepository.findAndCount({
-        where: whereCondition,
-        relations: ['contactGroup', 'templates', 'session'],
-        order: { createdAt: 'DESC' },
-        skip,
-        take: options.limit || 50
-      });
-
-      return { campaigns, total };
-    }
-  }
-
-  // Get campaign by ID with all relations
-  async getCampaignById(id: number): Promise<Campaign> {
-    const campaign = await this.campaignRepository.findByIdWithRelations(id, {
-      includeContactGroup: true,
-      includeTemplates: true,
-      includeSession: true
-    });
-
-    if (!campaign) {
-      throw new Error(`Campaign with ID ${id} not found`);
-    }
-
-    return campaign;
-  }
-
-  // Get campaigns by session
-  async getCampaignsBySession(
-    sessionId: number,
-    options: {
-      page?: number;
-      limit?: number;
-    } = {}
-  ): Promise<{ campaigns: Campaign[]; total: number }> {
-    try {
-      const campaigns = await this.campaignRepository.findBySessionId(sessionId);
-      
-      // Apply additional filters
-      let filteredCampaigns = campaigns;
-      
-      // Apply pagination
-      const skip = ((options.page || 1) - 1) * (options.limit || 50);
-      const paginatedCampaigns = filteredCampaigns.slice(skip, skip + (options.limit || 50));
-
-      console.log(`📊 Found ${paginatedCampaigns.length} campaigns for session ${sessionId}`);
-      return { campaigns: paginatedCampaigns, total: filteredCampaigns.length };
-    } catch (error) {
-      console.error('Error getting campaigns by session:', error);
+      console.error('Error getting campaign progress:', error);
       throw error;
     }
   }
 
-  // Update campaign
+  /**
+   * Get progress for all campaigns (with optional session filter)
+   */
+  async getAllCampaignsProgress(sessionId?: number): Promise<CampaignProgressDto[]> {
+    try {
+      const options: CampaignQueryOptions = {
+        includeContactGroup: true,
+        includeTemplates: true,
+        includeSession: true
+      };
+      
+      if (sessionId) {
+        options.sessionId = sessionId;
+      }
+
+      const { campaigns } = await this.getCampaigns(options);
+      
+      const progressData: CampaignProgressDto[] = campaigns.map(campaign => ({
+        campaignId: campaign.id,
+        campaignName: campaign.name,
+        status: campaign.status,
+        totalContacts: campaign.totalContacts,
+        messagesSent: campaign.messagesSent,
+        messagesFailed: campaign.messagesFailed,
+        messagesPending: campaign.messagesPending,
+        progressPercentage: campaign.progressPercentage,
+        successRate: campaign.successRate,
+        nextSendAt: campaign.nextSendAt,
+        startedAt: campaign.startedAt,
+        completedAt: campaign.completedAt,
+        estimatedCompletionAt: campaign.estimatedCompletionAt,
+        remainingContacts: campaign.remainingContacts,
+        lastSent: campaign.lastSent,
+        isCompleted: campaign.isCompleted,
+        isActive: campaign.isActive
+      }));
+
+      return progressData;
+    } catch (error) {
+      console.error('Error getting all campaigns progress:', error);
+      throw error;
+    }
+  }
+
+  // ========== CAMPAIGN JOB MANAGEMENT ==========
+
+  /**
+   * Create campaign jobs for all contacts in the campaign
+   */
+  async createCampaignJobs(campaignId: number): Promise<{ jobs: CampaignJob[]; totalJobs: number }> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const campaign = await this.getCampaignById(campaignId);
+      
+      if (!campaign.contactGroup) {
+        throw new Error('Campaign has no contact group assigned');
+      }
+
+      if (!campaign.templates || campaign.templates.length === 0) {
+        throw new Error('Campaign has no templates');
+      }
+
+      // Get contacts from the contact group
+      const contactService = new (await import('./ContactService')).ContactService();
+      const contacts = await contactService.getContactsByGroup(campaign.groupId);
+      
+      if (!contacts || contacts.length === 0) {
+        throw new Error('Contact group has no contacts');
+      }
+
+      let cumulativeDelay = 0;
+      const jobs: CampaignJob[] = [];
+
+      // Create jobs for each contact
+      for (let i = 0; i < contacts.length; i++) {
+        const contact = contacts[i];
+        
+        // Generate random delay between min and max intervals
+        const randomDelayMinutes = Math.floor(
+          Math.random() * (campaign.maxIntervalMinutes - campaign.minIntervalMinutes + 1)
+        ) + campaign.minIntervalMinutes;
+        
+        cumulativeDelay += randomDelayMinutes;
+
+        // Select random template
+        const randomTemplateIndex = Math.floor(Math.random() * campaign.templates.length);
+        const selectedTemplate = campaign.templates[randomTemplateIndex];
+
+        // Create job record
+        const job = queryRunner.manager.create(CampaignJob, {
+          campaignId: campaign.id,
+          contactId: contact.id,
+          templateId: selectedTemplate.id,
+          contactPhone: contact.phone,
+          templateMessage: selectedTemplate.message,
+          sessionName: campaign.session.sessionName,
+          status: 'pending',
+          scheduledAt: new Date(Date.now() + (cumulativeDelay * 60 * 1000)),
+          delayMinutes: randomDelayMinutes
+        });
+
+        const savedJob = await queryRunner.manager.save(job);
+        jobs.push(savedJob);
+      }
+
+      await queryRunner.commitTransaction();
+      
+      console.log(`📋 Created ${jobs.length} campaign jobs for campaign: ${campaign.name}`);
+      return { jobs, totalJobs: jobs.length };
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      console.error('Error creating campaign jobs:', error);
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  /**
+   * Update job status with queue job ID
+   */
+  async updateJobWithQueueId(jobId: number, queueJobId: string): Promise<void> {
+    try {
+      await this.campaignJobRepository.update(jobId, { queueJobId });
+      console.log(`🔗 Linked job ${jobId} with queue job ${queueJobId}`);
+    } catch (error) {
+      console.error('Error updating job with queue ID:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get campaign job statistics
+   */
+  async getCampaignJobStats(campaignId: number): Promise<any> {
+    try {
+      const stats = await this.campaignJobRepository
+        .createQueryBuilder('job')
+        .select('job.status', 'status')
+        .addSelect('COUNT(*)', 'count')
+        .addSelect('AVG(job.delayMinutes)', 'avgDelay')
+        .where('job.campaignId = :campaignId', { campaignId })
+        .groupBy('job.status')
+        .getRawMany();
+
+      const totalJobs = await this.campaignJobRepository.count({
+        where: { campaignId }
+      });
+
+      const nextJob = await this.campaignJobRepository.findOne({
+        where: { 
+          campaignId,
+          status: 'pending'
+        },
+        order: { scheduledAt: 'ASC' }
+      });
+
+      return {
+        totalJobs,
+        statusBreakdown: stats,
+        nextScheduledJob: nextJob ? {
+          jobId: nextJob.id,
+          scheduledAt: nextJob.scheduledAt,
+          contactPhone: nextJob.contactPhone,
+          delayMinutes: nextJob.delayMinutes
+        } : null
+      };
+    } catch (error) {
+      console.error('Error getting campaign job stats:', error);
+      throw error;
+    }
+  }
+
+  // ========== CAMPAIGN STATUS MANAGEMENT ==========
+
+  /**
+   * Start a campaign - updates status and creates jobs
+   */
+  async startCampaign(campaignId: number): Promise<{
+    campaign: Campaign;
+    jobs: CampaignJob[];
+    totalJobs: number;
+  }> {
+    try {
+      const campaign = await this.getCampaignById(campaignId);
+      
+      if (campaign.status === 'running') {
+        throw new Error('Campaign is already running');
+      }
+
+      if (campaign.status === 'completed') {
+        throw new Error('Campaign is already completed');
+      }
+
+      // Create jobs for all contacts
+      const { jobs, totalJobs } = await this.createCampaignJobs(campaignId);
+      
+      // Initialize progress tracking
+      const updatedCampaign = await this.initializeCampaignProgress(campaignId, totalJobs);
+      
+      console.log(`🚀 Campaign started: ${campaign.name} with ${totalJobs} jobs`);
+      return { campaign: updatedCampaign, jobs, totalJobs };
+    } catch (error) {
+      console.error('Error starting campaign:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Pause a running campaign
+   */
+  async pauseCampaign(campaignId: number): Promise<Campaign> {
+    try {
+      const campaign = await this.getCampaignById(campaignId);
+      
+      if (campaign.status !== 'running') {
+        throw new Error('Only running campaigns can be paused');
+      }
+
+      campaign.status = 'paused';
+      campaign.pausedAt = new Date();
+      
+      const updatedCampaign = await this.campaignRepository.save(campaign);
+      console.log(`⏸️ Campaign paused: ${campaign.name}`);
+      
+      return updatedCampaign;
+    } catch (error) {
+      console.error('Error pausing campaign:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Resume a paused campaign
+   */
+  async resumeCampaign(campaignId: number): Promise<Campaign> {
+    try {
+      const campaign = await this.getCampaignById(campaignId);
+      
+      if (campaign.status !== 'paused') {
+        throw new Error('Only paused campaigns can be resumed');
+      }
+
+      campaign.status = 'running';
+      campaign.pausedAt = null;
+      
+      const updatedCampaign = await this.campaignRepository.save(campaign);
+      console.log(`▶️ Campaign resumed: ${campaign.name}`);
+      
+      return updatedCampaign;
+    } catch (error) {
+      console.error('Error resuming campaign:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Cancel a campaign
+   */
+  async cancelCampaign(campaignId: number): Promise<Campaign> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      const campaign = await queryRunner.manager.findOne(Campaign, {
+        where: { id: campaignId }
+      });
+
+      if (!campaign) {
+        throw new Error(`Campaign with ID ${campaignId} not found`);
+      }
+
+      if (campaign.status === 'completed') {
+        throw new Error('Cannot cancel a completed campaign');
+      }
+
+      // Cancel all pending jobs
+      await queryRunner.manager.update(CampaignJob, 
+        { campaignId, status: 'pending' },
+        { status: 'cancelled' }
+      );
+
+      // Update campaign status
+      campaign.status = 'cancelled';
+      campaign.completedAt = new Date();
+      campaign.nextSendAt = null;
+
+      const updatedCampaign = await queryRunner.manager.save(campaign);
+      await queryRunner.commitTransaction();
+      
+      console.log(`❌ Campaign cancelled: ${campaign.name}`);
+      return updatedCampaign;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      console.error('Error cancelling campaign:', error);
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+    // Update campaign
   async updateCampaign(id: number, updateCampaignDto: UpdateCampaignDto): Promise<Campaign> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
@@ -375,41 +732,135 @@ export class CampaignService {
     }
   }
 
-  // Search campaigns
-  async searchCampaigns(
-    searchQuery: string,
-    options: {
-      sessionId?: number;
-      page?: number;
-      limit?: number;
-    } = {}
-  ): Promise<{ campaigns: Campaign[]; total: number }> {
-    try {
-      const queryBuilder = this.campaignRepository.createQueryBuilder('campaign')
-        .leftJoinAndSelect('campaign.contactGroup', 'contactGroup')
-        .leftJoinAndSelect('campaign.templates', 'template')
-        .leftJoinAndSelect('campaign.session', 'session')
-        .where('campaign.name LIKE :search OR campaign.description LIKE :search', 
-               { search: `%${searchQuery}%` });
+  async createCampaign(createCampaignDto: CreateCampaignDto): Promise<Campaign> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-      if (options.sessionId) {
-        queryBuilder.andWhere('campaign.sessionId = :sessionId', { sessionId: options.sessionId });
+    try {
+      console.log(`🚀 Creating new campaign: ${createCampaignDto.name}`);
+
+      // Validate session
+      if (createCampaignDto.sessionId) {
+        const session = await this.sessionRepository.findOne({
+          where: { id: createCampaignDto.sessionId }
+        });
+        if (!session) {
+          throw new Error(`Session with ID ${createCampaignDto.sessionId} not found`);
+        }
+        console.log(`✅ Session validated: ${session.sessionName}`);
       }
 
-      const skip = ((options.page || 1) - 1) * (options.limit || 50);
-      queryBuilder.skip(skip).take(options.limit || 50);
+      // Validate contact group
+      if (createCampaignDto.groupId) {
+        const group = await this.contactGroupRepository.findOne({
+          where: { id: createCampaignDto.groupId }
+        });
+        if (!group) {
+          throw new Error(`Contact group with ID ${createCampaignDto.groupId} not found`);
+        }
+        console.log(`✅ Contact group validated: ${group.name}`);
+      }
 
-      const [campaigns, total] = await queryBuilder.getManyAndCount();
+      // Create campaign entity with new progress fields
+      const campaign = queryRunner.manager.create(Campaign, {
+        name: createCampaignDto.name,
+        description: createCampaignDto.description,
+        minIntervalMinutes: createCampaignDto.minIntervalMinutes ?? 30,
+        maxIntervalMinutes: createCampaignDto.maxIntervalMinutes ?? 120,
+        sessionId: createCampaignDto.sessionId,
+        groupId: createCampaignDto.groupId,
+        status: 'inactive',
+        totalContacts: 0,
+        messagesSent: 0,
+        messagesFailed: 0,
+        messagesPending: 0,
+        progressPercentage: 0
+      } as DeepPartial<Campaign>);
 
-      console.log(`🔍 Search "${searchQuery}" found ${campaigns.length} campaigns`);
-      return { campaigns, total };
+      const savedCampaign = await queryRunner.manager.save(campaign);
+      console.log(`✅ Campaign created with ID: ${savedCampaign.id}`);
+
+      // Handle templates
+      if (createCampaignDto.templateIds && createCampaignDto.templateIds.length > 0) {
+        const templates = await this.templateRepository.find({
+          where: { id: In(createCampaignDto.templateIds) }
+        });
+
+        if (templates.length !== createCampaignDto.templateIds.length) {
+          const foundIds = templates.map(t => t.id);
+          const missingIds = createCampaignDto.templateIds.filter(id => !foundIds.includes(id));
+          throw new Error(`Templates not found with IDs: ${missingIds.join(', ')}`);
+        }
+
+        savedCampaign.templates = templates;
+        console.log(`✅ Added ${templates.length} templates to campaign`);
+      }
+
+      const finalCampaign = await queryRunner.manager.save(savedCampaign);
+      await queryRunner.commitTransaction();
+
+      console.log(`🎉 Campaign created successfully: ${finalCampaign.name}`);
+      return this.getCampaignById(finalCampaign.id);
+
     } catch (error) {
-      console.error('Error searching campaigns:', error);
+      await queryRunner.rollbackTransaction();
+      console.error('Error creating campaign:', error);
       throw error;
+    } finally {
+      await queryRunner.release();
     }
   }
 
-  // Business logic methods
+  // Keep all existing methods...
+  async getCampaigns(options: CampaignQueryOptions = {}): Promise<{ campaigns: Campaign[]; total: number }> {
+    try {
+      const campaigns = await this.campaignRepository.findAllWithRelations(options);
+      
+      const whereCondition: any = {};
+      if (options.sessionId) whereCondition.sessionId = options.sessionId;
+      if (options.isActive !== undefined) whereCondition.isActive = options.isActive;
+      if (options.status) whereCondition.status = options.status;
+
+      const total = await this.campaignRepository.count({ where: whereCondition });
+
+      console.log(`📊 Found ${campaigns.length} campaigns (total: ${total})`);
+      return { campaigns, total };
+    } catch (error) {
+      console.error('Error getting campaigns:', error);
+      
+      const whereCondition: any = {};
+      if (options.sessionId) whereCondition.sessionId = options.sessionId;
+      if (options.isActive !== undefined) whereCondition.isActive = options.isActive;
+      if (options.status) whereCondition.status = options.status;
+
+      const skip = ((options.page || 1) - 1) * (options.limit || 50);
+      
+      const [campaigns, total] = await this.campaignRepository.findAndCount({
+        where: whereCondition,
+        relations: ['contactGroup', 'templates', 'session'],
+        order: { createdAt: 'DESC' },
+        skip,
+        take: options.limit || 50
+      });
+
+      return { campaigns, total };
+    }
+  }
+
+  async getCampaignById(id: number): Promise<Campaign> {
+    const campaign = await this.campaignRepository.findByIdWithRelations(id, {
+      includeContactGroup: true,
+      includeTemplates: true,
+      includeSession: true
+    });
+
+    if (!campaign) {
+      throw new Error(`Campaign with ID ${id} not found`);
+    }
+
+    return campaign;
+  }
 
   async updateLastSent(campaignId: number): Promise<Campaign> {
     try {
