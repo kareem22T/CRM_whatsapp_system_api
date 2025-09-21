@@ -5,6 +5,7 @@ import { Contact, ContactGroup } from '../entities/Contact';
 import { MessageTemplate } from '../entities/MessageTemplate';
 import { Session } from '../entities/Session';
 import { CampaignJob } from '../entities/CampaignJob';
+import { CampaignTimeScheduler } from '../utils/CampaignTimeScheduler';
 
 // DTOs for Campaign operations
 export interface CreateCampaignDto {
@@ -15,6 +16,11 @@ export interface CreateCampaignDto {
   sessionId?: number;
   groupId?: number;
   templateIds?: number[];
+  // NEW: Time scheduling fields
+  isAllDay?: boolean;
+  dailyStartTime?: string; // Format: "HH:MM:SS"
+  dailyEndTime?: string;   // Format: "HH:MM:SS"
+  timezone?: string;
 }
 
 export interface UpdateCampaignDto {
@@ -25,6 +31,11 @@ export interface UpdateCampaignDto {
   sessionId?: number;
   groupId?: number;
   templateIds?: number[];
+  // NEW: Time scheduling fields
+  isAllDay?: boolean;
+  dailyStartTime?: string;
+  dailyEndTime?: string;
+  timezone?: string;
 }
 
 export interface CampaignQueryOptions {
@@ -310,7 +321,7 @@ export class CampaignService {
   /**
    * Create campaign jobs for all contacts in the campaign
    */
-  async createCampaignJobs(campaignId: number): Promise<{ jobs: CampaignJob[]; totalJobs: number }> {
+  async createCampaignJobs(campaignId: number): Promise<{ jobs: CampaignJob[]; totalJobs: number; scheduleInfo: any }> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
@@ -334,25 +345,36 @@ export class CampaignService {
         throw new Error('Contact group has no contacts');
       }
 
-      let cumulativeDelay = 0;
+      console.log(`📅 Creating jobs for campaign "${campaign.name}" with time scheduling...`);
+      console.log(`   All Day: ${campaign.isAllDay}`);
+      if (!campaign.isAllDay) {
+        console.log(`   Daily Window: ${campaign.dailyStartTime} - ${campaign.dailyEndTime} (${campaign.timezone})`);
+      }
+
+      // Use the time scheduler to get optimal scheduling
+      const { scheduledTimes, estimatedCompletion } = CampaignTimeScheduler.scheduleJobsWithTimeWindows(
+        campaign, 
+        contacts.length, 
+        new Date()
+      );
+
+      console.log(`⏰ Scheduled ${scheduledTimes.length}/${contacts.length} jobs within time constraints`);
+
       const jobs: CampaignJob[] = [];
+      const scheduleInfo = CampaignTimeScheduler.getScheduleInfo(campaign);
 
-      // Create jobs for each contact
-      for (let i = 0; i < contacts.length; i++) {
+      // Create job records with scheduled times
+      for (let i = 0; i < Math.min(contacts.length, scheduledTimes.length); i++) {
         const contact = contacts[i];
+        const scheduledTime = scheduledTimes[i];
         
-        // Generate random delay between min and max intervals
-        const randomDelayMinutes = Math.floor(
-          Math.random() * (campaign.maxIntervalMinutes - campaign.minIntervalMinutes + 1)
-        ) + campaign.minIntervalMinutes;
-        
-        cumulativeDelay += randomDelayMinutes;
-
         // Select random template
         const randomTemplateIndex = Math.floor(Math.random() * campaign.templates.length);
         const selectedTemplate = campaign.templates[randomTemplateIndex];
 
-        // Create job record
+        // Calculate delay in minutes from now
+        const delayMinutes = Math.max(0, Math.floor((scheduledTime.getTime() - Date.now()) / 60000));
+
         const job = queryRunner.manager.create(CampaignJob, {
           campaignId: campaign.id,
           contactId: contact.id,
@@ -361,21 +383,46 @@ export class CampaignService {
           templateMessage: selectedTemplate.message,
           sessionName: campaign.session.sessionName,
           status: 'pending',
-          scheduledAt: new Date(Date.now() + (cumulativeDelay * 60 * 1000)),
-          delayMinutes: randomDelayMinutes
+          scheduledAt: scheduledTime,
+          delayMinutes: delayMinutes
         });
 
         const savedJob = await queryRunner.manager.save(job);
         jobs.push(savedJob);
       }
 
+      // Update campaign with next window information
+      if (!campaign.isAllDay) {
+        const nextWindow = CampaignTimeScheduler.getScheduleInfo(campaign).nextWindow;
+        campaign.nextWindowStart = nextWindow?.start || null;
+        await queryRunner.manager.save(campaign);
+      }
+
       await queryRunner.commitTransaction();
       
-      console.log(`📋 Created ${jobs.length} campaign jobs for campaign: ${campaign.name}`);
-      return { jobs, totalJobs: jobs.length };
+      console.log(`📋 Created ${jobs.length} campaign jobs with time scheduling`);
+      if (jobs.length < contacts.length) {
+        console.warn(`⚠️  Only ${jobs.length}/${contacts.length} jobs could be scheduled within time constraints`);
+      }
+
+      return { 
+        jobs, 
+        totalJobs: jobs.length,
+        scheduleInfo: {
+          canScheduleNow: scheduleInfo.canScheduleNow,
+          reason: scheduleInfo.reason,
+          nextAvailableTime: scheduleInfo.nextAvailableTime,
+          estimatedCompletion,
+          currentWindow: scheduleInfo.currentWindow ? 
+            CampaignTimeScheduler.formatTimeWindow(scheduleInfo.currentWindow) : null,
+          nextWindow: scheduleInfo.nextWindow ? 
+            CampaignTimeScheduler.formatTimeWindow(scheduleInfo.nextWindow) : null
+        }
+      };
+      
     } catch (error) {
       await queryRunner.rollbackTransaction();
-      console.error('Error creating campaign jobs:', error);
+      console.error('Error creating campaign jobs with time scheduling:', error);
       throw error;
     } finally {
       await queryRunner.release();
@@ -446,6 +493,7 @@ export class CampaignService {
     campaign: Campaign;
     jobs: CampaignJob[];
     totalJobs: number;
+    scheduleInfo: any;
   }> {
     try {
       const campaign = await this.getCampaignById(campaignId);
@@ -458,19 +506,71 @@ export class CampaignService {
         throw new Error('Campaign is already completed');
       }
 
-      // Create jobs for all contacts
-      const { jobs, totalJobs } = await this.createCampaignJobs(campaignId);
+      // Check time window constraints
+      const scheduleInfo = CampaignTimeScheduler.getScheduleInfo(campaign);
       
+      console.log(`🕐 Campaign time analysis:`, {
+        canScheduleNow: scheduleInfo.canScheduleNow,
+        reason: scheduleInfo.reason,
+        nextAvailableTime: scheduleInfo.nextAvailableTime?.toISOString()
+      });
+
+      // Create jobs with time scheduling
+      const { jobs, totalJobs, scheduleInfo: jobScheduleInfo } = await this.createCampaignJobs(campaignId);
+      
+      if (totalJobs === 0) {
+        throw new Error('No jobs could be scheduled within the campaign time constraints');
+      }
+
       // Initialize progress tracking
       const updatedCampaign = await this.initializeCampaignProgress(campaignId, totalJobs);
       
-      console.log(`🚀 Campaign started: ${campaign.name} with ${totalJobs} jobs`);
-      return { campaign: updatedCampaign, jobs, totalJobs };
+      console.log(`🚀 Campaign started with time scheduling: ${campaign.name} with ${totalJobs} jobs`);
+      
+      return { 
+        campaign: updatedCampaign, 
+        jobs, 
+        totalJobs,
+        scheduleInfo: jobScheduleInfo
+      };
+      
     } catch (error) {
-      console.error('Error starting campaign:', error);
+      console.error('Error starting campaign with time scheduling:', error);
       throw error;
     }
   }
+
+
+  /**
+   * Check if campaign can run at current time
+   */
+  async validateCampaignTiming(campaignId: number): Promise<{
+    canRun: boolean;
+    reason: string;
+    nextAvailableTime: Date | null;
+    currentWindow: string | null;
+    nextWindow: string | null;
+  }> {
+    try {
+      const campaign = await this.getCampaignById(campaignId);
+      const scheduleInfo = CampaignTimeScheduler.getScheduleInfo(campaign);
+      
+      return {
+        canRun: scheduleInfo.canScheduleNow,
+        reason: scheduleInfo.reason,
+        nextAvailableTime: scheduleInfo.nextAvailableTime,
+        currentWindow: scheduleInfo.currentWindow ? 
+          CampaignTimeScheduler.formatTimeWindow(scheduleInfo.currentWindow) : null,
+        nextWindow: scheduleInfo.nextWindow ? 
+          CampaignTimeScheduler.formatTimeWindow(scheduleInfo.nextWindow) : null
+      };
+      
+    } catch (error) {
+      console.error('Error validating campaign timing:', error);
+      throw error;
+    }
+  }
+
 
   /**
    * Pause a running campaign
@@ -566,14 +666,14 @@ export class CampaignService {
     }
   }
 
-    // Update campaign
+  // Update campaign
   async updateCampaign(id: number, updateCampaignDto: UpdateCampaignDto): Promise<Campaign> {
     const queryRunner = this.dataSource.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
-      console.log(`📝 Updating campaign ID: ${id}`);
+      console.log(`📝 Updating campaign with time scheduling ID: ${id}`);
 
       const campaign = await this.campaignRepository.findByIdWithRelations(id, {
         includeContactGroup: true,
@@ -584,6 +684,25 @@ export class CampaignService {
         throw new Error(`Campaign with ID ${id} not found`);
       }
 
+      // Validate time scheduling updates
+      if (updateCampaignDto.isAllDay === false) {
+        const startTime = updateCampaignDto.dailyStartTime ?? campaign.dailyStartTime;
+        const endTime = updateCampaignDto.dailyEndTime ?? campaign.dailyEndTime;
+        
+        if (!startTime || !endTime) {
+          throw new Error('Daily start and end times are required when isAllDay is false');
+        }
+
+        // Validate time format
+        const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$/;
+        if (updateCampaignDto.dailyStartTime && !timeRegex.test(updateCampaignDto.dailyStartTime)) {
+          throw new Error('Invalid dailyStartTime format. Use HH:MM or HH:MM:SS');
+        }
+        if (updateCampaignDto.dailyEndTime && !timeRegex.test(updateCampaignDto.dailyEndTime)) {
+          throw new Error('Invalid dailyEndTime format. Use HH:MM or HH:MM:SS');
+        }
+      }
+
       // Update basic fields
       if (updateCampaignDto.name !== undefined) campaign.name = updateCampaignDto.name;
       if (updateCampaignDto.description !== undefined) campaign.description = updateCampaignDto.description;
@@ -592,26 +711,11 @@ export class CampaignService {
       if (updateCampaignDto.sessionId !== undefined) campaign.sessionId = updateCampaignDto.sessionId;
       if (updateCampaignDto.groupId !== undefined) campaign.groupId = updateCampaignDto.groupId;
 
-      // Validate session if provided
-      if (updateCampaignDto.sessionId) {
-        const session = await this.sessionRepository.findOne({
-          where: { id: updateCampaignDto.sessionId }
-        });
-        if (!session) {
-          throw new Error(`Session with ID ${updateCampaignDto.sessionId} not found`);
-        }
-      }
-
-      // Validate contact group if provided
-      if (updateCampaignDto.groupId) {
-        const group = await this.contactGroupRepository.findOne({
-          where: { id: updateCampaignDto.groupId }
-        });
-        if (!group) {
-          throw new Error(`Contact group with ID ${updateCampaignDto.groupId} not found`);
-        }
-        console.log(`📝 Updated contact group: ${group.name}`);
-      }
+      // Update time scheduling fields
+      if (updateCampaignDto.isAllDay !== undefined) campaign.isAllDay = updateCampaignDto.isAllDay;
+      if (updateCampaignDto.dailyStartTime !== undefined) campaign.dailyStartTime = updateCampaignDto.dailyStartTime;
+      if (updateCampaignDto.dailyEndTime !== undefined) campaign.dailyEndTime = updateCampaignDto.dailyEndTime;
+      if (updateCampaignDto.timezone !== undefined) campaign.timezone = updateCampaignDto.timezone;
 
       // Handle templates relation update
       if (updateCampaignDto.templateIds !== undefined) {
@@ -636,12 +740,20 @@ export class CampaignService {
 
       const updatedCampaign = await queryRunner.manager.save(campaign);
       await queryRunner.commitTransaction();
+
+      // Log updated time scheduling info
+      if (!updatedCampaign.isAllDay) {
+        console.log(`⏰ Updated time window: ${updatedCampaign.dailyStartTime} - ${updatedCampaign.dailyEndTime} (${updatedCampaign.timezone})`);
+        
+        const scheduleInfo = CampaignTimeScheduler.getScheduleInfo(updatedCampaign);
+        console.log(`📅 Current schedule status: ${scheduleInfo.reason}`);
+      }
       
       console.log(`✅ Campaign updated successfully: ${updatedCampaign.name}`);
       return this.getCampaignById(updatedCampaign.id);
     } catch (error) {
       await queryRunner.rollbackTransaction();
-      console.error('Error updating campaign:', error);
+      console.error('Error updating campaign with time scheduling:', error);
       throw error;
     } finally {
       await queryRunner.release();
@@ -738,7 +850,28 @@ export class CampaignService {
     await queryRunner.startTransaction();
 
     try {
-      console.log(`🚀 Creating new campaign: ${createCampaignDto.name}`);
+      console.log(`🚀 Creating new campaign with time scheduling: ${createCampaignDto.name}`);
+
+      console.log(createCampaignDto);
+      
+
+      // Validate time scheduling parameters
+      if (!createCampaignDto.isAllDay) {
+        if (!createCampaignDto.dailyStartTime || !createCampaignDto.dailyEndTime) {
+          throw new Error('Daily start and end times are required when isAllDay is false');
+        }
+        
+        // Validate time format
+        const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$/;
+        if (!timeRegex.test(createCampaignDto.dailyStartTime)) {
+          throw new Error('Invalid dailyStartTime format. Use HH:MM or HH:MM:SS');
+        }
+        if (!timeRegex.test(createCampaignDto.dailyEndTime)) {
+          throw new Error('Invalid dailyEndTime format. Use HH:MM or HH:MM:SS');
+        }
+
+        console.log(`⏰ Time window: ${createCampaignDto.dailyStartTime} - ${createCampaignDto.dailyEndTime} (${createCampaignDto.timezone || 'UTC'})`);
+      }
 
       // Validate session
       if (createCampaignDto.sessionId) {
@@ -762,7 +895,7 @@ export class CampaignService {
         console.log(`✅ Contact group validated: ${group.name}`);
       }
 
-      // Create campaign entity with new progress fields
+      // Create campaign entity with time scheduling fields
       const campaign = queryRunner.manager.create(Campaign, {
         name: createCampaignDto.name,
         description: createCampaignDto.description,
@@ -775,7 +908,12 @@ export class CampaignService {
         messagesSent: 0,
         messagesFailed: 0,
         messagesPending: 0,
-        progressPercentage: 0
+        progressPercentage: 0,
+        // NEW: Time scheduling fields
+        isAllDay: createCampaignDto.isAllDay ?? true,
+        dailyStartTime: createCampaignDto.dailyStartTime || null,
+        dailyEndTime: createCampaignDto.dailyEndTime || null,
+        timezone: createCampaignDto.timezone || 'UTC'
       } as DeepPartial<Campaign>);
 
       const savedCampaign = await queryRunner.manager.save(campaign);
@@ -800,17 +938,29 @@ export class CampaignService {
       const finalCampaign = await queryRunner.manager.save(savedCampaign);
       await queryRunner.commitTransaction();
 
+      // Log time scheduling summary
+      if (!finalCampaign.isAllDay) {
+        const scheduleInfo = CampaignTimeScheduler.getScheduleInfo(finalCampaign);
+        console.log(`📅 Campaign time schedule summary:`);
+        console.log(`   Can run now: ${scheduleInfo.canScheduleNow}`);
+        console.log(`   Reason: ${scheduleInfo.reason}`);
+        if (scheduleInfo.nextAvailableTime) {
+          console.log(`   Next available: ${scheduleInfo.nextAvailableTime.toLocaleString()}`);
+        }
+      }
+
       console.log(`🎉 Campaign created successfully: ${finalCampaign.name}`);
       return this.getCampaignById(finalCampaign.id);
 
     } catch (error) {
       await queryRunner.rollbackTransaction();
-      console.error('Error creating campaign:', error);
+      console.error('Error creating campaign with time scheduling:', error);
       throw error;
     } finally {
       await queryRunner.release();
     }
   }
+
 
   // Keep all existing methods...
   async getCampaigns(options: CampaignQueryOptions = {}): Promise<{ campaigns: Campaign[]; total: number }> {

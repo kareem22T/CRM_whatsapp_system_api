@@ -16,6 +16,7 @@ import { Queue, Worker } from 'bullmq';
 import IORedis from 'ioredis';
 import * as XLSX from "xlsx";
 import multer from "multer";
+import { CampaignTimeScheduler } from './utils/CampaignTimeScheduler.ts';
 
 declare global {
   namespace Express {
@@ -1193,8 +1194,13 @@ app.post('/campaigns', AuthMiddleware.authenticate, async (req, res) => {
       sessionId,
       minIntervalMinutes,
       maxIntervalMinutes,
-      groupId,      // Required field
-      templateIds
+      groupId,
+      templateIds,
+      // NEW: Time scheduling fields
+      isAllDay,
+      dailyStartTime,
+      dailyEndTime,
+      timezone
     } = req.body;
 
     if (!name) {
@@ -1205,119 +1211,83 @@ app.post('/campaigns', AuthMiddleware.authenticate, async (req, res) => {
       return res.status(400).json(createResponse(false, null, 'Contact group ID is required'));
     }
 
-    const campaign = await campaignService.createCampaign({
+    // Validate time scheduling parameters
+    if (!isAllDay && (!dailyStartTime || !dailyEndTime)) {
+      
+      return res.status(400).json(createResponse(
+        false, 
+        null, 
+        'Daily start and end times are required when isAllDay is false'
+      ));
+    }
+
+    // Validate time format if provided
+    if (dailyStartTime || dailyEndTime) {
+      const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$/;
+      if (dailyStartTime && !timeRegex.test(dailyStartTime)) {
+        return res.status(400).json(createResponse(
+          false, 
+          null, 
+          'Invalid dailyStartTime format. Use HH:MM or HH:MM:SS'
+        ));
+      }
+      if (dailyEndTime && !timeRegex.test(dailyEndTime)) {
+        return res.status(400).json(createResponse(
+          false, 
+          null, 
+          'Invalid dailyEndTime format. Use HH:MM or HH:MM:SS'
+        ));
+      }
+    }
+
+    const createDto = {
       name,
       description,
       sessionId,
-      minIntervalMinutes,
-      maxIntervalMinutes,
+      minIntervalMinutes: minIntervalMinutes || 30,
+      maxIntervalMinutes: maxIntervalMinutes || 120,
       groupId,
-      templateIds
-    });
+      templateIds: templateIds || [],
+      // Time scheduling fields
+      isAllDay: isAllDay !== undefined ? isAllDay : true,
+      dailyStartTime: dailyStartTime || null,
+      dailyEndTime: dailyEndTime || null,
+      timezone: timezone || 'Africa/Cairo'
+    };
 
-    res.status(201).json(createResponse(true, campaign, 'Campaign created successfully'));
-  } catch (error: any) {
-    console.error('Create campaign error:', error);
-    res.status(400).json(createResponse(false, null, error.message || 'Failed to create campaign'));
-  }
-});
+    const campaign = await campaignService.createCampaign(createDto);
 
-// Get all campaigns
-app.get('/campaigns', AuthMiddleware.authenticate, async (req, res) => {
-  try {
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
-    const sessionId = req.query.sessionId ? parseInt(req.query.sessionId as string) : undefined;
-    const isActive = req.query.isActive ? req.query.isActive === 'true' : undefined;
-    const status = req.query.status as string;
-    const includeContactGroup = req.query.includeContactGroup === 'true';  // Changed from includeContacts
-    const includeTemplates = req.query.includeTemplates === 'true';
-    const includeSession = req.query.includeSession === 'true';
+    // Get schedule validation info
+    const timingValidation = await campaignService.validateCampaignTiming(campaign.id);
 
-    const options = filterUndefined({
-      page,
-      limit,
-      sessionId,
-      isActive,
-      status,
-      includeContactGroup,  // Updated property name
-      includeTemplates,
-      includeSession
-    });
-
-    const { campaigns, total } = await campaignService.getCampaigns(options);
-    const pagination = getPaginationInfo(page, limit, total);
-
-    res.json(createResponse(
+    res.status(201).json(createResponse(
       true,
-      campaigns,
-      `Found ${campaigns.length} campaigns`,
-      pagination
+      {
+        campaign: {
+          id: campaign.id,
+          name: campaign.name,
+          description: campaign.description,
+          status: campaign.status,
+          sessionName: campaign.session?.sessionName,
+          contactGroupName: campaign.contactGroup?.name,
+          templateCount: campaign.templates?.length || 0,
+          minIntervalMinutes: campaign.minIntervalMinutes,
+          maxIntervalMinutes: campaign.maxIntervalMinutes,
+          // Time scheduling info
+          isAllDay: campaign.isAllDay,
+          dailyStartTime: campaign.dailyStartTime,
+          dailyEndTime: campaign.dailyEndTime,
+          timezone: campaign.timezone,
+          createdAt: campaign.createdAt
+        },
+        timeScheduling: timingValidation
+      },
+      `Campaign "${name}" created successfully with time scheduling`
     ));
 
   } catch (error: any) {
-    console.error('Get campaigns error:', error);
-    res.status(500).json(createResponse(false, null, 'Failed to retrieve campaigns'));
-  }
-});
-
-// Get campaign by ID
-app.get('/campaigns/:id', AuthMiddleware.authenticate, async (req, res) => {
-  try {
-    const campaignId = parseInt(req.params.id);
-    const campaign = await campaignService.getCampaignById(campaignId);
-
-    res.json(createResponse(true, campaign, 'Campaign retrieved successfully'));
-
-  } catch (error: any) {
-    console.error('Get campaign error:', error);
-    if (error.message.includes('not found')) {
-      res.status(404).json(createResponse(false, null, error.message));
-    } else {
-      res.status(500).json(createResponse(false, null, 'Failed to retrieve campaign'));
-    }
-  }
-});
-
-// Update campaign
-app.put('/campaigns/:id', AuthMiddleware.authenticate, async (req, res) => {
-  try {
-    const campaignId = parseInt(req.params.id);
-    const { 
-      name, 
-      description, 
-      sessionId, 
-      isActive, 
-      minIntervalMinutes, 
-      maxIntervalMinutes, 
-      status, 
-      groupId,        // Changed from contactIds to groupId
-      templateIds 
-    } = req.body;
-
-    const updateData = filterUndefined({
-      name,
-      description,
-      sessionId,
-      isActive,
-      minIntervalMinutes,
-      maxIntervalMinutes,
-      status,
-      groupId,        // Updated field name
-      templateIds
-    });
-
-    const updatedCampaign = await campaignService.updateCampaign(campaignId, updateData);
-
-    res.json(createResponse(true, updatedCampaign, 'Campaign updated successfully'));
-
-  } catch (error: any) {
-    console.error('Update campaign error:', error);
-    if (error.message.includes('not found')) {
-      res.status(404).json(createResponse(false, null, error.message));
-    } else {
-      res.status(400).json(createResponse(false, null, error.message || 'Failed to update campaign'));
-    }
+    console.error('Create campaign error:', error);
+    res.status(400).json(createResponse(false, null, error.message || 'Failed to create campaign'));
   }
 });
 
@@ -1335,6 +1305,212 @@ app.delete('/campaigns/:id', AuthMiddleware.authenticate, async (req, res) => {
       res.status(404).json(createResponse(false, null, error.message));
     } else {
       res.status(500).json(createResponse(false, null, 'Failed to delete campaign'));
+    }
+  }
+});
+
+
+// Updated Get all campaigns with time scheduling info
+app.get('/campaigns', AuthMiddleware.authenticate, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+    const sessionId = req.query.sessionId ? parseInt(req.query.sessionId as string) : undefined;
+    const isActive = req.query.isActive ? req.query.isActive === 'true' : undefined;
+    const status = req.query.status as string;
+    const includeContactGroup = req.query.includeContactGroup === 'true';
+    const includeTemplates = req.query.includeTemplates === 'true';
+    const includeSession = req.query.includeSession === 'true';
+    const includeTimeScheduling = req.query.includeTimeScheduling !== 'false'; // Include by default
+
+    const options = filterUndefined({
+      page,
+      limit,
+      sessionId,
+      isActive,
+      status,
+      includeContactGroup,
+      includeTemplates,
+      includeSession
+    });
+
+    const { campaigns, total } = await campaignService.getCampaigns(options);
+
+    // Add time scheduling information if requested
+    const campaignsWithScheduling = includeTimeScheduling ? campaigns.map(campaign => {
+      const scheduleInfo = CampaignTimeScheduler.getScheduleInfo(campaign);
+      
+      return {
+        ...campaign,
+        timeScheduling: {
+          isAllDay: campaign.isAllDay,
+          dailyStartTime: campaign.dailyStartTime,
+          dailyEndTime: campaign.dailyEndTime,
+          timezone: campaign.timezone,
+          canRunNow: scheduleInfo.canScheduleNow,
+          scheduleReason: scheduleInfo.reason,
+          nextAvailableTime: scheduleInfo.nextAvailableTime,
+          currentWindow: scheduleInfo.currentWindow ? 
+            CampaignTimeScheduler.formatTimeWindow(scheduleInfo.currentWindow) : null,
+          nextWindow: scheduleInfo.nextWindow ? 
+            CampaignTimeScheduler.formatTimeWindow(scheduleInfo.nextWindow) : null,
+          hasEnoughTimeForJob: CampaignTimeScheduler.hasEnoughTimeForJob(campaign)
+        }
+      };
+    }) : campaigns;
+
+    const pagination = getPaginationInfo(page, limit, total);
+
+    res.json(createResponse(
+      true,
+      campaignsWithScheduling,
+      `Found ${campaigns.length} campaigns`,
+      pagination
+    ));
+
+  } catch (error: any) {
+    console.error('Get campaigns error:', error);
+    res.status(500).json(createResponse(false, null, 'Failed to retrieve campaigns'));
+  }
+});
+
+// Updated Get campaign by ID with time scheduling info
+app.get('/campaigns/:id', AuthMiddleware.authenticate, async (req, res) => {
+  try {
+    const campaignId = parseInt(req.params.id);
+    const includeTimeScheduling = req.query.includeTimeScheduling !== 'false';
+    
+    const campaign = await campaignService.getCampaignById(campaignId);
+
+    let responseData = null;
+
+    if (includeTimeScheduling) {
+      const scheduleInfo = CampaignTimeScheduler.getScheduleInfo(campaign);
+      
+      responseData = {
+        ...campaign,
+        timeScheduling: {
+          isAllDay: campaign.isAllDay,
+          dailyStartTime: campaign.dailyStartTime,
+          dailyEndTime: campaign.dailyEndTime,
+          timezone: campaign.timezone,
+          canRunNow: scheduleInfo.canScheduleNow,
+          scheduleReason: scheduleInfo.reason,
+          nextAvailableTime: scheduleInfo.nextAvailableTime,
+          currentWindow: scheduleInfo.currentWindow ? 
+            CampaignTimeScheduler.formatTimeWindow(scheduleInfo.currentWindow) : null,
+          nextWindow: scheduleInfo.nextWindow ? 
+            CampaignTimeScheduler.formatTimeWindow(scheduleInfo.nextWindow) : null,
+          hasEnoughTimeForJob: CampaignTimeScheduler.hasEnoughTimeForJob(campaign)
+        }
+      };
+    } else {
+      responseData = campaign;
+    }
+
+    res.json(createResponse(true, responseData, 'Campaign retrieved successfully'));
+
+  } catch (error: any) {
+    console.error('Get campaign error:', error);
+    if (error.message.includes('not found')) {
+      res.status(404).json(createResponse(false, null, error.message));
+    } else {
+      res.status(500).json(createResponse(false, null, 'Failed to retrieve campaign'));
+    }
+  }
+});
+
+// Updated Update campaign with time scheduling
+app.put('/campaigns/:id', AuthMiddleware.authenticate, async (req, res) => {
+  try {
+    const campaignId = parseInt(req.params.id);
+    const { 
+      name, 
+      description, 
+      sessionId, 
+      isActive, 
+      minIntervalMinutes, 
+      maxIntervalMinutes, 
+      status, 
+      groupId,
+      templateIds,
+      // NEW: Time scheduling fields
+      isAllDay,
+      dailyStartTime,
+      dailyEndTime,
+      timezone
+    } = req.body;
+
+    // Validate time scheduling updates
+    if (isAllDay === false) {
+      const startTime = dailyStartTime;
+      const endTime = dailyEndTime;
+      
+      if (!startTime || !endTime) {
+        return res.status(400).json(createResponse(
+          false, 
+          null, 
+          'Daily start and end times are required when isAllDay is false'
+        ));
+      }
+
+      // Validate time format
+      const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?$/;
+      if (dailyStartTime && !timeRegex.test(dailyStartTime)) {
+        return res.status(400).json(createResponse(
+          false, 
+          null, 
+          'Invalid dailyStartTime format. Use HH:MM or HH:MM:SS'
+        ));
+      }
+      if (dailyEndTime && !timeRegex.test(dailyEndTime)) {
+        return res.status(400).json(createResponse(
+          false, 
+          null, 
+          'Invalid dailyEndTime format. Use HH:MM or HH:MM:SS'
+        ));
+      }
+    }
+
+    const updateData = filterUndefined({
+      name,
+      description,
+      sessionId,
+      isActive,
+      minIntervalMinutes,
+      maxIntervalMinutes,
+      status,
+      groupId,
+      templateIds,
+      // Time scheduling fields
+      isAllDay,
+      dailyStartTime,
+      dailyEndTime,
+      timezone
+    });
+
+    const updatedCampaign = await campaignService.updateCampaign(campaignId, updateData);
+
+    // Get updated schedule validation info
+    const timingValidation = await campaignService.validateCampaignTiming(campaignId);
+
+    res.json(createResponse(
+      true, 
+      {
+        campaign: {
+          ...updatedCampaign,
+          timeScheduling: timingValidation
+        }
+      }, 
+      'Campaign updated successfully'
+    ));
+
+  } catch (error: any) {
+    console.error('Update campaign error:', error);
+    if (error.message.includes('not found')) {
+      res.status(404).json(createResponse(false, null, error.message));
+    } else {
+      res.status(400).json(createResponse(false, null, error.message || 'Failed to update campaign'));
     }
   }
 });

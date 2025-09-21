@@ -28,13 +28,26 @@ export class Campaign {
   @Column({ type: 'int', name: 'max_interval_minutes', default: 120 })
   maxIntervalMinutes: number;
 
+  // NEW: Daily time scheduling fields
+  @Column({ type: 'bit', name: 'is_all_day', default: 1, comment: 'If true, campaign runs 24/7. If false, uses start/end times' })
+  isAllDay: boolean;
+
+  @Column({ type: 'time', name: 'daily_start_time', nullable: true, comment: 'Daily start time (e.g., 02:00:00)' })
+  dailyStartTime: string | null; // Format: "HH:MM:SS"
+
+  @Column({ type: 'time', name: 'daily_end_time', nullable: true, comment: 'Daily end time (e.g., 05:00:00)' })
+  dailyEndTime: string | null; // Format: "HH:MM:SS"
+
+  @Column({ type: 'varchar', length: 50, name: 'timezone', default: 'UTC', comment: 'Timezone for daily schedule' })
+  timezone: string;
+
   @Column({ type: 'datetime', nullable: true, name: 'last_sent' })
   lastSent: Date;
 
   // Campaign Status and Progress Tracking
-  @Column({ 
-    type: 'varchar', 
-    length: 50, 
+  @Column({
+    type: 'varchar',
+    length: 50,
     default: 'inactive',
     comment: 'Campaign status: inactive, active, running, paused, completed, failed'
   })
@@ -63,6 +76,10 @@ export class Campaign {
   // Next scheduled send time
   @Column({ type: 'datetime', nullable: true, name: 'next_send_at' })
   nextSendAt: Date | null;
+
+  // NEW: Next available window start
+  @Column({ type: 'datetime', nullable: true, name: 'next_window_start' })
+  nextWindowStart: Date | null;
 
   // Campaign completion tracking
   @Column({ type: 'datetime', nullable: true, name: 'started_at' })
@@ -124,5 +141,26 @@ export class Campaign {
   get successRate(): number {
     if (this.messagesSent + this.messagesFailed === 0) return 0;
     return (this.messagesSent / (this.messagesSent + this.messagesFailed)) * 100;
+  }
+
+  // NEW: Helper methods for time scheduling
+  get hasTimeRestrictions(): boolean {
+    return (!this.isAllDay && this.dailyStartTime && this.dailyEndTime) ? true : false;
+  }
+
+  get dailyStartTimeAsDate(): Date | null {
+    if (!this.dailyStartTime) return null;
+    const [hours, minutes, seconds] = this.dailyStartTime.split(':').map(Number);
+    const date = new Date();
+    date.setHours(hours, minutes, seconds || 0, 0);
+    return date;
+  }
+
+  get dailyEndTimeAsDate(): Date | null {
+    if (!this.dailyEndTime) return null;
+    const [hours, minutes, seconds] = this.dailyEndTime.split(':').map(Number);
+    const date = new Date();
+    date.setHours(hours, minutes, seconds || 0, 0);
+    return date;
   }
 }
