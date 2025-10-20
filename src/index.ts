@@ -601,6 +601,21 @@ const upload = multer({
   },
 });
 
+const uploadImage = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    // Accept common image formats
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only image files are allowed!"));
+    }
+  },
+});
+
 // ✅ Import contacts from Excel
 app.post(
   "/contacts/import-excel",
@@ -1100,21 +1115,45 @@ app.get('/contact-groups/stats', AuthMiddleware.authenticate, async (req, res) =
   }
 });
 
-// Create message template
-app.post('/templates', AuthMiddleware.authenticate, async (req, res) => {
+app.post('/templates', AuthMiddleware.authenticate, uploadImage.single('image'), async (req, res) => {
   try {
     const { name, message } = req.body;
 
     if (!name || !message) {
-      return res.status(400).json({ success: false, message: 'Name and message are required' });
+      return res.status(400).json(createResponse(false, null, 'Name and message are required'));
     }
 
-    const template = messageTemplateService.createTemplate({ name, message });
+    const imageFile = req.file ? {
+      filename: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+      data: req.file.buffer
+    } : undefined;
 
-    res.status(201).json({ success: true, data: template, message: 'Template created successfully' });
+    const template = await messageTemplateService.createTemplate({
+      name,
+      message,
+      imageFile
+    });
+
+    // Return template without image data for efficiency
+    res.status(201).json(createResponse(
+      true,
+      {
+        id: template.id,
+        name: template.name,
+        message: template.message,
+        hasImage: !!template.imageData,
+        imageFilename: template.imageFilename,
+        imageMimetype: template.imageMimetype,
+        imageSize: template.imageSize,
+        createdAt: template.createdAt
+      },
+      'Template created successfully'
+    ));
   } catch (error: any) {
     console.error('Create template error:', error);
-    res.status(500).json({ success: false, message: 'Failed to create template' });
+    res.status(400).json(createResponse(false, null, error.message || 'Failed to create template'));
   }
 });
 
@@ -1122,66 +1161,137 @@ app.post('/templates', AuthMiddleware.authenticate, async (req, res) => {
 app.get('/templates', AuthMiddleware.authenticate, async (_req, res) => {
   try {
     const templates = await messageTemplateService.getAllTemplates();
-    res.json({ success: true, data: templates });
+    res.json(createResponse(
+      true,
+      templates.map(t => ({
+        ...t,
+        hasImage: !!t.imageFilename
+      })),
+      'Templates retrieved successfully'
+    ));
   } catch (error: any) {
     console.error('Get templates error:', error);
-    res.status(500).json({ success: false, message: 'Failed to retrieve templates' });
+    res.status(500).json(createResponse(false, null, 'Failed to retrieve templates'));
   }
 });
 
-// Get template by ID
+// Get template by ID (without image data)
 app.get('/templates/:id', AuthMiddleware.authenticate, async (req, res) => {
   try {
-    const template = await messageTemplateService.getTemplateById(parseInt(req.params.id));
+    const template = await messageTemplateService.getTemplateByIdLean(parseInt(req.params.id));
 
     if (!template) {
-      return res.status(404).json({ success: false, message: 'Template not found' });
+      return res.status(404).json(createResponse(false, null, 'Template not found'));
     }
 
-    res.json({ success: true, data: template });
+    res.json(createResponse(
+      true,
+      {
+        ...template,
+        hasImage: !!template.imageFilename
+      },
+      'Template retrieved successfully'
+    ));
   } catch (error: any) {
     console.error('Get template error:', error);
-    res.status(500).json({ success: false, message: 'Failed to retrieve template' });
+    res.status(500).json(createResponse(false, null, 'Failed to retrieve template'));
   }
 });
 
-// Update template
-app.put('/templates/:id', AuthMiddleware.authenticate, async (req, res) => {
+// Update template with optional image
+app.put('/templates/:id', AuthMiddleware.authenticate, uploadImage.single('image'), async (req, res) => {
   try {
+    const templateId = parseInt(req.params.id);
     const { name, message } = req.body;
-    const template = await messageTemplateService.getTemplateById(parseInt(req.params.id));
+
+    const imageFile = req.file ? {
+      filename: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+      data: req.file.buffer
+    } : undefined;
+
+    const template = await messageTemplateService.updateTemplate(templateId, {
+      ...(name && { name }),
+      ...(message && { message }),
+      ...(imageFile && { imageFile })
+    });
 
     if (!template) {
-      return res.status(404).json({ success: false, message: 'Template not found' });
+      return res.status(404).json(createResponse(false, null, 'Template not found'));
     }
 
-    template.name = name ?? template.name;
-    template.message = message ?? template.message;
-
-    await messageTemplateService.updateTemplate(template.id, template);
-
-    res.json({ success: true, data: template, message: 'Template updated successfully' });
+    res.json(createResponse(
+      true,
+      {
+        id: template.id,
+        name: template.name,
+        message: template.message,
+        hasImage: !!template.imageData,
+        imageFilename: template.imageFilename,
+        imageMimetype: template.imageMimetype,
+        imageSize: template.imageSize,
+        updatedAt: template.updatedAt
+      },
+      'Template updated successfully'
+    ));
   } catch (error: any) {
     console.error('Update template error:', error);
-    res.status(500).json({ success: false, message: 'Failed to update template' });
+    res.status(400).json(createResponse(false, null, error.message || 'Failed to update template'));
+  }
+});
+
+// Remove image from template
+app.delete('/templates/:id/image', AuthMiddleware.authenticate, async (req, res) => {
+  try {
+    const templateId = parseInt(req.params.id);
+    const template = await messageTemplateService.removeImage(templateId);
+
+    if (!template) {
+      return res.status(404).json(createResponse(false, null, 'Template not found'));
+    }
+
+    res.json(createResponse(true, null, 'Image removed from template successfully'));
+  } catch (error: any) {
+    console.error('Remove image error:', error);
+    res.status(500).json(createResponse(false, null, 'Failed to remove image'));
+  }
+});
+
+// Get template image
+app.get('/templates/:id/image', AuthMiddleware.authenticate, async (req, res) => {
+  try {
+    const templateId = parseInt(req.params.id);
+    const template = await messageTemplateService.getTemplateById(templateId);
+
+    if (!template || !template.imageData) {
+      return res.status(404).json(createResponse(false, null, 'Template or image not found'));
+    }
+
+    res.setHeader('Content-Type', template.imageMimetype || 'image/jpeg');
+    res.setHeader('Content-Length', template.imageSize);
+    res.setHeader('Content-Disposition', `inline; filename="${template.imageFilename}"`);
+    res.send(template.imageData);
+  } catch (error: any) {
+    console.error('Get template image error:', error);
+    res.status(500).json(createResponse(false, null, 'Failed to retrieve image'));
   }
 });
 
 // Delete template
 app.delete('/templates/:id', AuthMiddleware.authenticate, async (req, res) => {
   try {
-    const template = await messageTemplateService.getTemplateById(parseInt(req.params.id));
+    const templateId = parseInt(req.params.id);
+    const deleted = await messageTemplateService.deleteTemplate(templateId);
 
-    if (!template) {
-      return res.status(404).json({ success: false, message: 'Template not found' });
+    if (!deleted) {
+      return res.status(404).json(createResponse(false, null, 'Template not found'));
     }
 
-    await messageTemplateService.deleteTemplate(template.id);
-
-    res.json({ success: true, message: 'Template deleted successfully' });
+    res.json(createResponse(true, null, 'Template deleted successfully'));
   } catch (error: any) {
     console.error('Delete template error:', error);
-    res.status(500).json({ success: false, message: 'Failed to delete template' });
+    res.status(500).json(createResponse(false, null, 'Failed to delete template'));
   }
 });
 

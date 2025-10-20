@@ -40,6 +40,8 @@ export class ContactGroup {
 @Index(['phone'])
 @Index(['company'])
 @Index(['isActive'])
+@Index(['isChecked'])
+@Index(['isWpContact'])
 export class Contact {
   @PrimaryGeneratedColumn()
   id: number;
@@ -68,6 +70,19 @@ export class Contact {
   @Column({ type: 'bit', default: true, name: 'is_active' })
   isActive: boolean;
 
+  // NEW: WhatsApp verification fields
+  @Column({ type: 'bit', default: false, name: 'is_checked', comment: 'Whether this contact has been checked for WhatsApp' })
+  isChecked: boolean;
+
+  @Column({ type: 'bit', default: false, name: 'is_wp_contact', comment: 'Whether this contact has a WhatsApp account' })
+  isWpContact: boolean;
+
+  @Column({ type: 'datetime', nullable: true, name: 'checked_at', comment: 'When the WhatsApp verification was performed' })
+  checkedAt: Date | null;
+
+  @Column({ type: 'varchar', length: 100, nullable: true, name: 'checked_by_session', comment: 'Which session performed the check' })
+  checkedBySession: string | null;
+
   @Column({ type: 'datetime', nullable: true, name: 'last_contacted' })
   lastContacted: Date;
 
@@ -86,4 +101,12 @@ export class Contact {
   })
   groups: ContactGroup[];
 
+  // Helper methods
+  get needsVerification(): boolean {
+    return !this.isChecked;
+  }
+
+  get isVerifiedWhatsAppUser(): boolean {
+    return this.isChecked && this.isWpContact;
+  }
 }

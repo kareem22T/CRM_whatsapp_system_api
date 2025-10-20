@@ -3,6 +3,7 @@ import 'reflect-metadata';
 import { Client } from 'whatsapp-web.js';
 import pkg from 'whatsapp-web.js';
 const { LocalAuth, MessageMedia } = pkg;
+import { MessageTemplateService } from './services/MessageTemplateService.ts';
 
 import fs from 'fs';
 import path from 'path';
@@ -28,6 +29,7 @@ import IORedis from 'ioredis';
 import { CampaignService } from './services/CampaignService.ts';
 import { ContactService } from './services/ContactService.ts';
 import { CampaignJobService } from './services/CampaignJobService.ts';
+import { ContactVerificationService } from './services/ContactVerificationService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -73,6 +75,7 @@ let sessionService: SessionService;
 let chatService: ChatService;
 let contactService: ContactService;
 let campaignJobService: CampaignJobService;
+let messageTemplateService: MessageTemplateService;
 
 // Create media directory if it doesn't exist
 const mediaDir = path.join(__dirname, 'media');
@@ -1383,6 +1386,7 @@ app.post('/campaign/:campaignId/cancel', async (req, res) => {
 
 // ========== UPDATED CAMPAIGN WORKER ==========
 
+
 /**
  * Enhanced campaign worker with progress tracking
  * Update the existing campaignWorker to include progress updates
@@ -1400,7 +1404,7 @@ const campaignWorker = new Worker('send-campaign-message', async (job) => {
   } = job.data;
 
   try {
-    console.log(`Processing enhanced campaign message job: Contact ${contactPhone}, Template ${templateId}`);
+    console.log(`📋 Processing campaign message: ${contactPhone}, Template ${templateId}`);
 
     // Update job status to processing
     await campaignService.updateCampaignJobProgress(campaignId, {
@@ -1409,19 +1413,68 @@ const campaignWorker = new Worker('send-campaign-message', async (job) => {
       processingStartedAt: new Date()
     });
 
-    // Check if session is still ready
+    // Check if session is ready
     if (!isClientReady(sessionName)) {
       throw new Error(`Session "${sessionName}" is not ready`);
     }
 
-    // Send message using existing sendMessage function
-    const result = await sendMessage(
-      sessionName, 
-      contactPhone, 
-      templateMessage
-    );
+    // Get template with image data
+    const template = await messageTemplateService.getTemplateWithImage(templateId);
+    
+    if (!template) {
+      throw new Error(`Template with ID ${templateId} not found`);
+    }
 
-    // Update job status to completed with success
+    let result;
+
+    // Check if template has an image
+    if (template.hasImage && template.imageData) {
+      console.log(`📎 Sending with image: ${template.imageFilename}`);
+      
+      // Create temporary file
+      const tempFilePath = path.join(__dirname, 'temp', 
+        `campaign_${Date.now()}_${template.imageFilename}`);
+      
+      // Ensure temp directory exists
+      const tempDir = path.join(__dirname, 'temp');
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+      
+      // Write image to temp file
+      fs.writeFileSync(tempFilePath, template.imageData);
+
+      try {
+        // Send with media
+        result = await sendMessage(
+          sessionName,
+          contactPhone,
+          template.message,      // Message text (will be caption)
+          tempFilePath,          // Media file path
+          template.message,      // Caption
+          null,                  // No reply
+          template.imageFilename, // Original filename
+          template.imageMimetype  // Mimetype
+        );
+
+        console.log(`✅ Media message sent to ${contactPhone}`);
+      } finally {
+        // Clean up temp file
+        if (fs.existsSync(tempFilePath)) {
+          fs.unlinkSync(tempFilePath);
+        }
+      }
+    } else {
+      // Send text-only message
+      console.log(`📝 Sending text-only to ${contactPhone}`);
+      result = await sendMessage(
+        sessionName, 
+        contactPhone, 
+        templateMessage
+      );
+    }
+
+    // Update job as completed
     await campaignService.updateCampaignJobProgress(campaignId, {
       jobId: String(job.id),
       status: 'completed',
@@ -1429,8 +1482,9 @@ const campaignWorker = new Worker('send-campaign-message', async (job) => {
       processedAt: new Date()
     });
 
-    console.log(`Campaign message sent successfully to ${contactPhone} via ${sessionName}`);
-    console.log(`Campaign "${campaignName}" - Message sent to contact ${contactId} using template ${templateId}`);
+    const mediaInfo = template.hasImage ? 
+      ` with ${template.imageFilename}` : '';
+    console.log(`✅ Campaign message sent to ${contactPhone}${mediaInfo}`);
 
     return {
       success: true,
@@ -1439,21 +1493,21 @@ const campaignWorker = new Worker('send-campaign-message', async (job) => {
       contactPhone,
       templateId,
       messageId: result.messageId,
+      hasMedia: template.hasImage,
+      mediaFilename: template.imageFilename,
       sentAt: new Date().toISOString()
     };
 
   } catch (error: any) {
-    console.error(`Failed to send campaign message to ${contactPhone}:`, error);
+    console.error(`❌ Failed to send to ${contactPhone}:`, error);
     
-    // Update job status to failed
+    // Update job as failed
     await campaignService.updateCampaignJobProgress(campaignId, {
       jobId: String(job.id),
       status: 'failed',
       errorMessage: error.message,
       processedAt: new Date()
     });
-
-    console.log(`Campaign "${campaignName}" - Failed to send message to contact ${contactId}: ${error.message}`);
     
     throw error;
   }
@@ -1728,6 +1782,430 @@ function emitCampaignStatusChange(campaignId: number, oldStatus: string, newStat
   console.log(`📡 Real-time campaign status change emitted: Campaign ${campaignId} - ${oldStatus} -> ${newStatus}`);
 }
 
+// ========== CONTACT VERIFICATION ENDPOINTS ==========
+
+/**
+ * Start verification for a contact group
+ * POST /verification/group/:groupId/start
+ * Body: { sessionName: string, minDelay?: number, maxDelay?: number }
+ */
+app.post('/verification/group/:groupId/start', async (req, res) => {
+  const groupId = parseInt(req.params.groupId);
+  const { sessionName, minDelay = 5, maxDelay = 15 } = req.body;
+
+  if (!groupId || isNaN(groupId)) {
+    return res.status(400).json(createResponse(
+      false,
+      null,
+      'Valid group ID is required'
+    ));
+  }
+
+  if (!sessionName) {
+    return res.status(400).json(createResponse(
+      false,
+      null,
+      'Session name is required'
+    ));
+  }
+
+  // Check if session is ready
+  if (!isClientReady(sessionName)) {
+    return res.status(400).json(createResponse(
+      false,
+      null,
+      `Session "${sessionName}" is not ready`
+    ));
+  }
+
+  try {
+    const verificationService = new ContactVerificationService(dbManager.dataSource);
+
+    // Create verification jobs
+    const { totalContacts, uncheckedContacts, jobs } = await verificationService.startGroupVerification(
+      groupId,
+      sessionName,
+      minDelay,
+      maxDelay
+    );
+
+    // Schedule all jobs in Bull queue
+    const jobsScheduled = [];
+    for (const job of jobs) {
+      const jobData = {
+        verificationJobId: job.id,
+        contactId: job.contactId,
+        contactPhone: job.contactPhone,
+        sessionName: job.sessionName,
+        delaySeconds: job.delaySeconds
+      };
+
+      const queueJob = await verificationQueue.add('verify-whatsapp-contact', jobData, {
+        delay: job.delaySeconds * 1000,
+        removeOnComplete: true,
+        removeOnFail: false,
+        attempts: job.maxRetries,
+        backoff: {
+          type: 'exponential',
+          delay: 10000
+        }
+      });
+
+      await verificationService.updateJobWithQueueId(job.id, String(queueJob.id));
+
+      jobsScheduled.push({
+        jobId: job.id,
+        queueJobId: queueJob.id,
+        contactPhone: job.contactPhone,
+        scheduledAt: job.scheduledAt.toISOString(),
+        delaySeconds: job.delaySeconds
+      });
+    }
+
+    console.log(`Verification started for group ${groupId}: ${uncheckedContacts} contacts queued`);
+
+    res.json(createResponse(
+      true,
+      {
+        groupId,
+        sessionName,
+        totalContacts,
+        uncheckedContacts,
+        jobsScheduled: jobsScheduled.length,
+        estimatedDuration: `${Math.ceil(jobs[jobs.length - 1]?.delaySeconds / 60)} minutes`
+      },
+      `Verification started for ${uncheckedContacts} contacts`
+    ));
+
+  } catch (error: any) {
+    console.error('Error starting group verification:', error);
+    res.status(500).json(createResponse(
+      false,
+      null,
+      `Failed to start verification: ${error.message}`
+    ));
+  }
+});
+
+/**
+ * Start verification for a single contact
+ * POST /verification/contact/:contactId/start
+ * Body: { sessionName: string, delaySeconds?: number }
+ */
+app.post('/verification/contact/:contactId/start', async (req, res) => {
+  const contactId = parseInt(req.params.contactId);
+  const { sessionName, delaySeconds = 0 } = req.body;
+
+  if (!contactId || isNaN(contactId)) {
+    return res.status(400).json(createResponse(
+      false,
+      null,
+      'Valid contact ID is required'
+    ));
+  }
+
+  if (!sessionName) {
+    return res.status(400).json(createResponse(
+      false,
+      null,
+      'Session name is required'
+    ));
+  }
+
+  if (!isClientReady(sessionName)) {
+    return res.status(400).json(createResponse(
+      false,
+      null,
+      `Session "${sessionName}" is not ready`
+    ));
+  }
+
+  try {
+    const verificationService = new ContactVerificationService(dbManager.dataSource);
+
+    const job = await verificationService.startContactVerification(
+      contactId,
+      sessionName,
+      delaySeconds
+    );
+
+    const jobData = {
+      verificationJobId: job.id,
+      contactId: job.contactId,
+      contactPhone: job.contactPhone,
+      sessionName: job.sessionName,
+      delaySeconds: job.delaySeconds
+    };
+
+    const queueJob = await verificationQueue.add('verify-whatsapp-contact', jobData, {
+      delay: delaySeconds * 1000,
+      removeOnComplete: true,
+      removeOnFail: false,
+      attempts: 2,
+      backoff: {
+        type: 'exponential',
+        delay: 10000
+      }
+    });
+
+    await verificationService.updateJobWithQueueId(job.id, String(queueJob.id));
+
+    res.json(createResponse(
+      true,
+      {
+        jobId: job.id,
+        queueJobId: queueJob.id,
+        contactId: job.contactId,
+        contactPhone: job.contactPhone,
+        scheduledAt: job.scheduledAt.toISOString()
+      },
+      'Contact verification job created'
+    ));
+
+  } catch (error: any) {
+    console.error('Error starting contact verification:', error);
+    res.status(500).json(createResponse(
+      false,
+      null,
+      `Failed to start verification: ${error.message}`
+    ));
+  }
+});
+
+/**
+ * Get verification progress for a group
+ * GET /verification/group/:groupId/progress
+ */
+app.get('/verification/group/:groupId/progress', async (req, res) => {
+  const groupId = parseInt(req.params.groupId);
+
+  if (!groupId || isNaN(groupId)) {
+    return res.status(400).json(createResponse(
+      false,
+      null,
+      'Valid group ID is required'
+    ));
+  }
+
+  try {
+    const verificationService = new ContactVerificationService(dbManager.dataSource);
+    const progress = await verificationService.getGroupVerificationProgress(groupId);
+
+    res.json(createResponse(
+      true,
+      progress,
+      'Verification progress retrieved'
+    ));
+
+  } catch (error: any) {
+    console.error('Error getting verification progress:', error);
+    res.status(500).json(createResponse(
+      false,
+      null,
+      `Failed to get progress: ${error.message}`
+    ));
+  }
+});
+
+/**
+ * Get verification jobs for a group
+ * GET /verification/group/:groupId/jobs?status=pending
+ */
+app.get('/verification/group/:groupId/jobs', async (req, res) => {
+  const groupId = parseInt(req.params.groupId);
+  const status = req.query.status as string;
+
+  if (!groupId || isNaN(groupId)) {
+    return res.status(400).json(createResponse(
+      false,
+      null,
+      'Valid group ID is required'
+    ));
+  }
+
+  try {
+    const verificationService = new ContactVerificationService(dbManager.dataSource);
+    const jobs = await verificationService.getGroupVerificationJobs(groupId, status);
+
+    res.json(createResponse(
+      true,
+      { jobs, total: jobs.length },
+      `Retrieved ${jobs.length} verification jobs`
+    ));
+
+  } catch (error: any) {
+    console.error('Error getting verification jobs:', error);
+    res.status(500).json(createResponse(
+      false,
+      null,
+      `Failed to get jobs: ${error.message}`
+    ));
+  }
+});
+
+/**
+ * Get verification statistics
+ * GET /verification/stats?groupId=123
+ */
+app.get('/verification/stats', async (req, res) => {
+  const groupId = req.query.groupId ? parseInt(req.query.groupId as string) : undefined;
+
+  try {
+    const verificationService = new ContactVerificationService(dbManager.dataSource);
+    const stats = await verificationService.getVerificationStats(groupId);
+
+    res.json(createResponse(
+      true,
+      stats,
+      'Verification statistics retrieved'
+    ));
+
+  } catch (error: any) {
+    console.error('Error getting verification stats:', error);
+    res.status(500).json(createResponse(
+      false,
+      null,
+      `Failed to get stats: ${error.message}`
+    ));
+  }
+});
+
+/**
+ * Retry failed verification job
+ * POST /verification/job/:jobId/retry
+ */
+app.post('/verification/job/:jobId/retry', async (req, res) => {
+  const jobId = parseInt(req.params.jobId);
+
+  if (!jobId || isNaN(jobId)) {
+    return res.status(400).json(createResponse(
+      false,
+      null,
+      'Valid job ID is required'
+    ));
+  }
+
+  try {
+    const verificationService = new ContactVerificationService(dbManager.dataSource);
+    const job = await verificationService.retryFailedJob(jobId);
+
+    const jobData = {
+      verificationJobId: job.id,
+      contactId: job.contactId,
+      contactPhone: job.contactPhone,
+      sessionName: job.sessionName,
+      delaySeconds: 0
+    };
+
+    const queueJob = await verificationQueue.add('verify-whatsapp-contact', jobData, {
+      delay: 0,
+      removeOnComplete: true,
+      removeOnFail: false,
+      attempts: 1
+    });
+
+    await verificationService.updateJobWithQueueId(job.id, String(queueJob.id));
+
+    res.json(createResponse(
+      true,
+      {
+        jobId: job.id,
+        queueJobId: queueJob.id,
+        retryCount: job.retryCount
+      },
+      'Job scheduled for retry'
+    ));
+
+  } catch (error: any) {
+    console.error('Error retrying verification job:', error);
+    res.status(500).json(createResponse(
+      false,
+      null,
+      `Failed to retry job: ${error.message}`
+    ));
+  }
+});
+
+// Create verification queue (add this near your other queue definitions)
+export const verificationQueue = new Queue('verify-whatsapp-contact', { connection });
+
+// Verification worker
+const verificationWorker = new Worker('verify-whatsapp-contact', async (job) => {
+  const {
+    verificationJobId,
+    contactId,
+    contactPhone,
+    sessionName,
+    delaySeconds
+  } = job.data;
+
+  try {
+    console.log(`Processing WhatsApp verification for contact: ${contactPhone}`);
+
+    const verificationService = new ContactVerificationService(dbManager.dataSource);
+
+    // Update job status to processing
+    await verificationService.updateJobProcessing(verificationJobId);
+
+    // Check if session is ready
+    if (!isClientReady(sessionName)) {
+      throw new Error(`Session "${sessionName}" is not ready`);
+    }
+
+    const client = activeSessions[sessionName];
+
+    // Format phone number for WhatsApp
+    const formattedNumber = formatPhoneNumber(contactPhone);
+
+    // Check if the number is registered on WhatsApp
+    let isWhatsappUser = false;
+    
+    try {
+      // Use WhatsApp Web's getNumberId method to check if number exists
+      const numberId = await client.getNumberId(formattedNumber);
+      
+      if (numberId && numberId._serialized) {
+        isWhatsappUser = true;
+        console.log(`✅ ${contactPhone} is a WhatsApp user`);
+      } else {
+        isWhatsappUser = false;
+        console.log(`❌ ${contactPhone} is NOT a WhatsApp user`);
+      }
+    } catch (checkError: any) {
+      // If getNumberId fails, the number is likely not on WhatsApp
+      console.log(`❌ ${contactPhone} check failed: ${checkError.message}`);
+      isWhatsappUser = false;
+    }
+
+    // Update job with result
+    await verificationService.updateJobResult(
+      verificationJobId,
+      isWhatsappUser,
+      contactId,
+      sessionName
+    );
+
+
+    console.log(`Verification completed for ${contactPhone}: ${isWhatsappUser ? 'WhatsApp' : 'Not WhatsApp'}`);
+
+    return {
+      success: true,
+      verificationJobId,
+      contactId,
+      contactPhone,
+      isWhatsappUser,
+      verifiedAt: new Date().toISOString()
+    };
+
+  } catch (error: any) {
+    console.error(`Failed to verify contact ${contactPhone}:`, error);
+
+    const verificationService = new ContactVerificationService(dbManager.dataSource);
+    await verificationService.updateJobFailed(verificationJobId, error.message);
+
+    throw error;
+  }
+}, { connection });
 
 // Start server
 server.listen(3002, () => {
@@ -1750,6 +2228,8 @@ async function main(): Promise<void> {
     messageService = new MessageService();
     sessionService = new SessionService();
     chatService = new ChatService();
+    messageTemplateService = new MessageTemplateService();
+    contactService = new ContactService();
     contactService = new ContactService();
     campaignJobService = new CampaignJobService(dbManager.dataSource);
     

@@ -8,6 +8,7 @@ import { Contact, ContactGroup } from '../entities/Contact.ts';
 import { MessageTemplate } from '../entities/MessageTemplate.ts';
 import { Campaign } from '../entities/Campaign.ts';
 import { CampaignJob } from '../entities/CampaignJob.ts';
+import { ContactVerificationJob } from '../entities/ContactVerificationJob.ts';
 
 export const AppDataSource = new DataSource({
   type: 'mssql',
@@ -18,7 +19,7 @@ export const AppDataSource = new DataSource({
   database: 'CRM_Whatsapp',
   synchronize: true,
   logging: false,
-  entities: [Message, Session, Chat, MessageAnalytics, User, Contact, ContactGroup, MessageTemplate, Campaign, CampaignJob],
+  entities: [Message, Session, Chat, MessageAnalytics, User, Contact, ContactGroup, MessageTemplate, Campaign, CampaignJob, ContactVerificationJob],
   migrations: ['src/migrations/*.ts'],
   subscribers: ['src/subscribers/*.ts'],
   options: {
@@ -29,7 +30,7 @@ export const AppDataSource = new DataSource({
 
 // export const AppDataSource = new DataSource({
 //   type: 'mssql',
-//   host: '192.168.1.149',
+//   host: '25.5.43.82',
 //   port: 1433,
 //   username: 'cyrus_crm_root',
 //   password: 'Password',
@@ -39,8 +40,10 @@ export const AppDataSource = new DataSource({
 //   entities: [Message, Session, Chat, MessageAnalytics, User, Contact, ContactGroup, MessageTemplate, Campaign, CampaignJob],
 //   migrations: ['src/migrations/*.ts'],
 //   subscribers: ['src/subscribers/*.ts'],
+//   requestTimeout: 30000,
 //   options: {
 //     encrypt: false,
+//     connectTimeout: 60000,
 //     trustServerCertificate: true
 //   }
 // });
