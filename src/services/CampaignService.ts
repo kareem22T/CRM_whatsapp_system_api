@@ -339,7 +339,9 @@ export class CampaignService {
 
       // Get contacts from the contact group
       const contactService = new (await import('./ContactService')).ContactService();
-      const contacts = await contactService.getContactsByGroup(campaign.groupId);
+
+      let allContacts = await contactService.getContactsByGroup(campaign.groupId);
+      const contacts = allContacts.filter((contact) => contact.isWpContact);
       
       if (!contacts || contacts.length === 0) {
         throw new Error('Contact group has no contacts');

@@ -1,4 +1,4 @@
-import { ContactRepository, ContactGroupRepository } from '../repositories/ContactRepository';
+import { ContactRepository, ContactGroupRepository, GroupCheckingStats } from '../repositories/ContactRepository';
 import { Contact, ContactGroup } from '../entities/Contact';
 import { DeepPartial } from 'typeorm';
 
@@ -393,7 +393,7 @@ export class ContactGroupService {
     limit?: number;
     search?: string;
     isActive?: boolean;
-  } = {}): Promise<{ groups: Array<ContactGroup & { contactCount: number }>; total: number }> {
+  } = {}): Promise<{ groups: Array<ContactGroup & { contactCount: number; checkingStates: GroupCheckingStats }>; total: number }> {
     try {
       const { page = 1, limit = 50, search = '', isActive } = options;
       
@@ -404,18 +404,19 @@ export class ContactGroupService {
           limit
         });
         
-        // Add contact count for searched groups
-        const groupsWithCount = await Promise.all(
+        // Add contact count and checking states for searched groups
+        const groupsWithStats = await Promise.all(
           groups.map(async (group) => {
-            const groupWithContacts = await this.groupRepository.findWithContacts(group.id);
+            const checkingStates = await this.groupRepository.getGroupCheckingStats(group.id);
             return {
               ...group,
-              contactCount: groupWithContacts?.contacts.length || 0
+              contactCount: checkingStates.totalContacts,
+              checkingStates
             };
           })
         );
 
-        return { groups: groupsWithCount, total };
+        return { groups: groupsWithStats, total };
       } else {
         // Use optimized query when not searching
         const allGroups = await this.groupRepository.findWithContactCount();
