@@ -26,13 +26,6 @@ export class ContactService {
         throw new Error('Contact with this phone number already exists');
         }
 
-        if (contactData.email) {
-        const existingEmailContact = await this.contactRepository.findByEmail(contactData.email);
-        if (existingEmailContact) {
-            throw new Error('Contact with this email already exists');
-        }
-        }
-
         const contact = this.contactRepository.create({
         name: contactData.name,
         email: contactData.email,
@@ -138,14 +131,6 @@ async updateContact(
       const existingContact = await this.contactRepository.findByPhone(updates.phone);
       if (existingContact && existingContact.id !== contactId) {
         throw new Error('Contact with this phone number already exists');
-      }
-    }
-
-    // Check for duplicate email if email is being updated
-    if (updates.email && updates.email !== contact.email) {
-      const existingEmailContact = await this.contactRepository.findByEmail(updates.email);
-      if (existingEmailContact && existingEmailContact.id !== contactId) {
-        throw new Error('Contact with this email already exists');
       }
     }
 
