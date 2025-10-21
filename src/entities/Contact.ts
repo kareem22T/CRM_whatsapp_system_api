@@ -1,4 +1,4 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn, ManyToMany, JoinTable, Index } from 'typeorm';
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn, ManyToMany, JoinTable, Index, OneToMany } from 'typeorm';
 import { Campaign } from './Campaign';
 
 @Entity('contact_groups')
@@ -30,7 +30,8 @@ export class ContactGroup {
   @ManyToMany(() => Contact, contact => contact.groups)
   contacts: Contact[];
 
-  @ManyToMany(() => Campaign, Campaign => Campaign.contactGroup)
+  // FIXED: Changed from @ManyToMany to @OneToMany since Campaign has @ManyToOne
+  @OneToMany(() => Campaign, campaign => campaign.contactGroup)
   campaigns: Campaign[];
 }
 
