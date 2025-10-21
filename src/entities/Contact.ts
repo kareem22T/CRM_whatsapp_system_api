@@ -53,7 +53,7 @@ export class Contact {
   @Column({ type: 'nvarchar', length: 255, nullable: true })
   email: string;
 
-  @Column({ type: 'nvarchar', length: 50 })
+  @Column({ type: 'nvarchar', length: 50, default: '' })
   phone: string;
 
   @Column({ type: 'nvarchar', length: 255, nullable: true })
