@@ -637,8 +637,8 @@ app.post(
 
       // جهّز الداتا للـ service
       const contactsData = rows.map((row) => ({
-        name: row["Name"],
-        email: row["Email"],
+        name: String(row["Name"]),
+        email: String(row["Email"]),
         phone: String(row["Phone"]),
         company: row["Company"],
         notes: row["Notes"],
