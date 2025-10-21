@@ -47,7 +47,7 @@ export class Contact {
   @PrimaryGeneratedColumn()
   id: number;
 
-  @Column({ type: 'nvarchar', length: 255 })
+  @Column({ type: 'nvarchar', length: 255, nullable: true })
   name: string;
 
   @Column({ type: 'nvarchar', length: 255, nullable: true })
