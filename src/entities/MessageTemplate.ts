@@ -9,7 +9,7 @@ export class MessageTemplate {
   @Column({ type: 'nvarchar', length: 255 })
   name: string;
 
-  @Column({ type: "nvarchar", , length: 'max' })
+  @Column({ type: "nvarchar", length: 'max' })
   message: string;
 
   @Column({ type: 'nvarchar', length: 500, nullable: true })
