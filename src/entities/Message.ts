@@ -26,7 +26,7 @@ export class Message {
   @Column({ type: 'varchar', length: 50, name: 'to_number' })
   toNumber: string;
 
-  @Column({ type: 'nvarchar', name: 'message_body', nullable: true })
+  @Column({ type: 'nvarchar', name: 'message_body', nullable: true, length: 'max' })
   messageBody: string;
 
   @Column({ type: 'varchar', length: 20, name: 'message_type' })
